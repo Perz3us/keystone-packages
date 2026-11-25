@@ -48,6 +48,7 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --title "${GITHUB_REF_NAME#v}" --repo "$GITHUB_REPOSITORY" \
+            case "$GITHUB_REF_NAME" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
+            gh release create "$GITHUB_REF_NAME" dist/* --title "${GITHUB_REF_NAME#v}" --repo "$GITHUB_REPOSITORY" $PRE \
               --notes "Install the .apk on NoobWRT and OpenWrt 25.12, or the .ipk on older firmware."
           fi
