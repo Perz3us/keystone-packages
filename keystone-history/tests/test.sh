@@ -30,7 +30,7 @@ cat > "$W/bin/uci" <<'X'
 #!/bin/sh
 case "$*" in
 *"show qmodem"*) echo "qmodem.m1=modem-device" ;;
-*keystone.main.ping_target*) [ -n "$FAKE_TARGET" ] && echo "$FAKE_TARGET" || exit 1 ;;
+*keystone-history.main.ping_target*) [ -n "$FAKE_TARGET" ] && echo "$FAKE_TARGET" || exit 1 ;;
 esac
 X
 cat > "$W/bin/date" <<'X'
@@ -118,8 +118,8 @@ setup() {
 	echo 0.1.0 > "$W/version"
 }
 
-collect() { sh "$HERE/files/keystone-collect" "$@"; }
-rpc() { sh "$HERE/files/keystone.rpcd" "$@"; }
+collect() { sh "$HERE/files/keystone-history" "$@"; }
+rpc() { sh "$HERE/files/keystone-history.rpcd" "$@"; }
 valid() { printf '%s' "$1" | tr -d '\n\t' | grep -Eq '^\{("[a-z]+":(\[[^]]*\]|"[^"]*"),?)+\}$|^\{"points":\[(\[[^]]*\],?)*\],"traffic":\[(\{[^}]*\},?)*\]\}$'; }
 
 setup
@@ -334,7 +334,7 @@ FAKE_NOW=1000120 collect
 [ -s "$W/etc/points" ] && ok "flush when the clock went backwards" || bad "flush when the clock went backwards"
 
 
-for f in keystone-collect keystone.rpcd keystone-helper.init; do
+for f in keystone-history keystone-history.rpcd keystone-history.init; do
 	sh -n "$HERE/files/$f" && ok "syntax $f" || bad "syntax $f"
 done
 

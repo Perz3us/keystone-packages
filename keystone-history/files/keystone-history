@@ -1,8 +1,8 @@
 #!/bin/sh
 
 mode=$1
-T=${KS_TMP:-/tmp/keystone}
-E=${KS_ETC:-/etc/keystone}
+T=${KS_TMP:-/tmp/keystone-history}
+E=${KS_ETC:-/etc/keystone-history}
 SYS=${KS_SYS:-/sys/class/net}
 G5=${KS_5G:-/tmp/5gmodem}
 UBUS=${UBUS:-ubus}
@@ -73,7 +73,7 @@ done
 band=$(printf '%s' "$band" | tr -d '"\\001-\037' | tr ' ' '_')
 [ -n "$band" ] || band=-
 
-target=$($UCI -q get keystone.main.ping_target)
+target=$($UCI -q get keystone-history.main.ping_target)
 [ -n "$target" ] || target=8.8.8.8
 ms=$($PING -c 1 -W 2 -I "$dev" "$target" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -n 1)
 [ -n "$ms" ] || ms=-

@@ -1,8 +1,8 @@
 #!/bin/sh
 
-T=${KS_TMP:-/tmp/keystone}
+T=${KS_TMP:-/tmp/keystone-history}
 UBUS=${UBUS:-ubus}
-VERSION=${KS_VERSION_FILE:-/usr/share/keystone-helper/version}
+VERSION=${KS_VERSION_FILE:-/usr/share/keystone-history/version}
 
 info() {
 	local s=

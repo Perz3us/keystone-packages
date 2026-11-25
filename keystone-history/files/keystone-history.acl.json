@@ -1,0 +1,11 @@
+{
+	"keystone-history": {
+		"description": "Grant access to the Keystone history",
+		"read": {
+			"ubus": {
+				"keystone.history": [ "info", "history" ]
+			},
+			"uci": [ "keystone-history" ]
+		}
+	}
+}

@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	mkdir -p /tmp/keystone-history
+	[ -e /tmp/keystone-history/points ] || { cp /etc/keystone-history/* /tmp/keystone-history/ 2>/dev/null && date +%s > /tmp/keystone-history/flushed; }
+	procd_open_instance
+	procd_set_param command /bin/sh -c 'while :; do /usr/sbin/keystone-history; sleep 120; done'
+	procd_set_param file /etc/config/keystone-history
+	procd_set_param respawn 3600 10 0
+	procd_close_instance
+}
+
+stop_service() {
+	/usr/sbin/keystone-history flush
+}
+
+service_triggers() {
+	procd_add_reload_trigger keystone-history
+}
