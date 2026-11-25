@@ -1,0 +1,115 @@
+#!/bin/sh
+
+mode=$1
+T=${KS_TMP:-/tmp/keystone}
+E=${KS_ETC:-/etc/keystone}
+SYS=${KS_SYS:-/sys/class/net}
+G5=${KS_5G:-/tmp/5gmodem}
+UBUS=${UBUS:-ubus}
+PING=${PING:-ping}
+UCI=${UCI:-uci}
+DATE=${DATE:-date}
+MINTIME=${KS_MIN_TIME:-1704067200}
+KEEP=604800
+CAP=900000
+
+now=$($DATE +%s)
+[ "$now" -ge "$MINTIME" ] 2>/dev/null || exit 0
+mkdir -p "$T"
+month=$($DATE +%Y-%m)
+
+wan_dev() {
+	$UBUS call network.interface dump 2>/dev/null | awk '
+		function out() { if (dev != "") print dev, proto, up, def }
+		/^[ \t]*"interface":/ { out(); up = 0; dev = ""; proto = "-"; def = 0; tgt = 0 }
+		/"up": true/ { up = 1 }
+		/"l3_device":/ { split($0, a, "\""); dev = a[4] }
+		/"proto":/ { split($0, a, "\""); proto = a[4] }
+		/"target": "0.0.0.0"/ { tgt = 1 }
+		/"mask": 0,?$/ { if (tgt) def = 1 }
+		END { out() }
+	' | awk '
+		$3 != 1 { next }
+		$2 ~ /^(wireguard|openvpn|vpnc|l2tp|pptp)$/ || $1 ~ /^(tun|wg|tailscale)/ { next }
+		$2 ~ /^(qmi|mbim|ncm|modemmanager|3g|wwan|quectel)$/ || $1 ~ /^(wwan|rmnet|qmimux|mhi_net|usb[0-9])/ { if (m == "") m = $1; next }
+		$4 == 1 { if (d == "") d = $1 }
+		END { print (m != "" ? m : d) }
+	'
+}
+
+num() { sed -n "s/.*\"$1\" *: *\"\{0,1\}\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | head -n 1; }
+str() { sed -n "s/.*\"$1\" *: *\"\([^\"]*\)\".*/\1/p" | head -n 1; }
+
+kv() {
+	awk -v want="$1" '
+		/"key":/ { split($0, a, "\""); k = tolower(a[4]) }
+		/"value":/ { split($0, a, "\""); if (k == want || k ~ (" " want "$")) { print a[4]; exit } }
+	'
+}
+
+dev=$(wan_dev)
+[ -n "$dev" ] || dev=wwan0
+
+rsrp=- sinr=- pci=- earfcn=- band=-
+f=$(find "$G5" -name 'metrics_*.json' -mmin -5 2>/dev/null | head -n 1)
+if [ -n "$f" ]; then
+	rsrp=$(num rsrp < "$f"); sinr=$(num sinr < "$f"); pci=$(num pci < "$f"); earfcn=$(num earfcn < "$f")
+	band=$(str pband < "$f")
+elif $UBUS list qmodem >/dev/null 2>&1; then
+	sec=$($UCI -q show qmodem | sed -n 's/^qmodem\.\([^.=]*\)=modem-device$/\1/p' | head -n 1)
+	arg="{\"config_section\":\"$sec\"}"
+	cell=$($UBUS call qmodem cell_info "$arg" 2>/dev/null)
+	rsrp=$(printf '%s\n' "$cell" | kv rsrp | sed -n 's/^\(-\{0,1\}[0-9][0-9.]*\).*/\1/p')
+	sinr=$(printf '%s\n' "$cell" | kv sinr | sed -n 's/^\(-\{0,1\}[0-9][0-9.]*\).*/\1/p')
+	cb=$($UBUS call qmodem get_current_band "$arg" 2>/dev/null)
+	pci=$(printf '%s\n' "$cb" | num pci)
+	earfcn=$(printf '%s\n' "$cb" | num channel)
+	band=$(printf '%s\n' "$cb" | str band_name)
+fi
+for v in rsrp sinr pci earfcn band; do
+	eval "x=\$$v"
+	[ -n "$x" ] || eval "$v=-"
+done
+band=$(printf '%s' "$band" | tr -d '"\\001-\037' | tr ' ' '_')
+[ -n "$band" ] || band=-
+
+target=$($UCI -q get keystone.main.ping_target)
+[ -n "$target" ] || target=8.8.8.8
+ms=$($PING -c 1 -W 2 -I "$dev" "$target" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -n 1)
+[ -n "$ms" ] || ms=-
+
+echo "$now $rsrp $sinr $ms $pci $earfcn $band" >> "$T/points"
+awk -v c=$((now - KEEP)) '$1 >= c' "$T/points" > "$T/points.new" && mv "$T/points.new" "$T/points"
+
+rx=$(cat "$SYS/$dev/statistics/rx_bytes" 2>/dev/null)
+tx=$(cat "$SYS/$dev/statistics/tx_bytes" 2>/dev/null)
+if [ -n "$rx" ] && [ -n "$tx" ]; then
+	dd=0 du=0
+	[ -f "$T/traffic.$month" ] && read -r dd du < "$T/traffic.$month"
+	if [ -f "$T/last" ]; then
+		read -r ldev lrx ltx < "$T/last"
+		if [ "$ldev" = "$dev" ]; then
+			if [ "$rx" -ge "$lrx" ]; then dd=$((dd + rx - lrx)); else dd=$((dd + rx)); fi
+			if [ "$tx" -ge "$ltx" ]; then du=$((du + tx - ltx)); else du=$((du + tx)); fi
+		fi
+	fi
+	echo "${dd:-0} ${du:-0}" > "$T/traffic.$month"
+	echo "$dev $rx $tx" > "$T/last"
+fi
+
+last=0
+[ -f "$T/flushed" ] && read -r last < "$T/flushed"
+since=$((now - last))
+if [ "$mode" = flush ] || [ "$since" -lt 0 ] || [ "$since" -ge 3600 ]; then
+	mkdir -p "$E"
+	if [ "$(wc -c < "$T/points")" -gt "$CAP" ]; then
+		tail -c "$CAP" "$T/points" | sed 1d > "$E/points.new"
+	else
+		cp "$T/points" "$E/points.new"
+	fi
+	mv "$E/points.new" "$E/points"
+	for t in "$T"/traffic.*; do
+		[ -f "$t" ] && cp "$t" "$E/"
+	done
+	echo "$now" > "$T/flushed"
+fi

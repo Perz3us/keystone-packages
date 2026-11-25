@@ -1,0 +1,11 @@
+{
+	"luci-app-keystone-helper": {
+		"description": "Grant access to the Keystone helper",
+		"read": {
+			"ubus": {
+				"keystone": [ "info", "history" ]
+			},
+			"uci": [ "keystone" ]
+		}
+	}
+}

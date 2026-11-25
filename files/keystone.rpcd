@@ -1,0 +1,50 @@
+#!/bin/sh
+
+T=${KS_TMP:-/tmp/keystone}
+UBUS=${UBUS:-ubus}
+VERSION=${KS_VERSION_FILE:-/usr/share/keystone-helper/version}
+
+info() {
+	local s=
+	$UBUS list qmodem >/dev/null 2>&1 && s='"qmodem",'
+	printf '{"version":"%s","sources":[%s"ping","traffic"]}\n' "$(cat "$VERSION" 2>/dev/null)" "$s"
+}
+
+history() {
+	local in from to
+	in=$(cat)
+	from=$(printf '%s' "$in" | sed -n 's/.*"from" *: *"\{0,1\}\([0-9][0-9]*\).*/\1/p')
+	to=$(printf '%s' "$in" | sed -n 's/.*"to" *: *"\{0,1\}\([0-9][0-9]*\).*/\1/p')
+	printf '{"points":['
+	awk -v f="${from:-0}" -v t="${to:-99999999999}" '
+		function n(v) { return v ~ /^-?[0-9.]+$/ ? v : "null" }
+		$1 >= f && $1 <= t {
+			b = "null"
+			if ($7 != "-") { gsub(/[\\"]/, "", $7); gsub(/_/, " ", $7); b = "\"" $7 "\"" }
+			printf "%s[%s,%s,%s,%s,%s,%s,%s]", sep, $1, n($2), n($3), n($4), n($5), n($6), b
+			sep = ","
+		}
+	' "$T/points" 2>/dev/null
+	printf '],"traffic":['
+	local sep= f2 m
+	for f2 in "$T"/traffic.*; do
+		[ -f "$f2" ] || continue
+		m=${f2##*/traffic.}
+		set -- $(cat "$f2")
+		printf '%s{"month":"%s","down":%s,"up":%s}' "$sep" "$m" "${1:-0}" "${2:-0}"
+		sep=,
+	done
+	printf ']}\n'
+}
+
+case "$1" in
+list)
+	echo '{ "info": {}, "history": { "from": 0, "to": 0 } }'
+	;;
+call)
+	case "$2" in
+	info) info ;;
+	history) history ;;
+	esac
+	;;
+esac
