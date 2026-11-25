@@ -31,6 +31,10 @@ cat > "$W/bin/uci" <<'X'
 case "$*" in
 *"show qmodem"*) echo "qmodem.m1=modem-device" ;;
 *keystone-history.main.ping_target*) [ -n "$FAKE_TARGET" ] && echo "$FAKE_TARGET" || exit 1 ;;
+*keystone-history.main.tcp_target*) [ -n "$FAKE_TCP" ] && echo "$FAKE_TCP" || exit 1 ;;
+*"set keystone-history.main.keep_days="*) echo "${*##*=}" > "$FAKE_KEEP" ;;
+*keystone-history.main.keep_days*) [ -f "$FAKE_KEEP" ] && cat "$FAKE_KEEP" || exit 1 ;;
+*commit*) echo "uci $*" >> "$FAKE_LOG" ;;
 esac
 X
 cat > "$W/bin/date" <<'X'
@@ -39,6 +43,15 @@ case "$1" in
 +%s) echo "$FAKE_NOW" ;;
 +%Y-%m) echo "${FAKE_MONTH:-2026-11}" ;;
 esac
+X
+printf '#!/bin/sh
+exec sh "%s/files/keystone-history" "$@"
+' "$HERE" > "$W/bin/collector"
+cat > "$W/bin/curl" <<'X'
+#!/bin/sh
+echo "curl $*" >> "$FAKE_LOG"
+[ -n "$FAKE_CURL" ] && { printf "%s" "$FAKE_CURL"; exit ${FAKE_CURL_RC:-0}; }
+exit 1
 X
 chmod +x "$W/bin/"*
 
@@ -104,16 +117,17 @@ cat > "$W/dump.json" <<'X'
 X
 
 setup() {
-	rm -rf "$W/tmp" "$W/etc" "$W/sys" "$W/g5" "$W/log"
+	rm -rf "$W/tmp" "$W/etc" "$W/sys" "$W/g5" "$W/log" "$W/keep"
 	mkdir -p "$W/tmp" "$W/etc" "$W/g5" "$W/sys/wwan0_1/statistics"
 	: > "$W/log"
 	echo 1000 > "$W/sys/wwan0_1/statistics/rx_bytes"
 	echo 500 > "$W/sys/wwan0_1/statistics/tx_bytes"
 	export KS_TMP="$W/tmp" KS_ETC="$W/etc" KS_SYS="$W/sys" KS_5G="$W/g5"
-	export UBUS="$W/bin/ubus" PING="$W/bin/ping" UCI="$W/bin/uci" DATE="$W/bin/date"
-	export FAKE_LOG="$W/log" FAKE_CELL="$W/cell.json" FAKE_BAND="$W/band.json" FAKE_DUMP="$W/dump.json"
+	export UBUS="$W/bin/ubus" PING="$W/bin/ping" CURL="$W/bin/curl" UCI="$W/bin/uci" DATE="$W/bin/date"
+	export FAKE_KEEP="$W/keep" KS_COLLECTOR="$W/bin/collector"
+export FAKE_LOG="$W/log" FAKE_CELL="$W/cell.json" FAKE_BAND="$W/band.json" FAKE_DUMP="$W/dump.json"
 	export FAKE_NOW=1000000 FAKE_QMODEM=1
-	unset FAKE_PING_FAIL FAKE_TARGET
+	unset FAKE_PING_FAIL FAKE_TARGET FAKE_CURL FAKE_TCP FAKE_CURL_RC
 	export KS_VERSION_FILE="$W/version" KS_MIN_TIME=0
 	echo 0.1.0 > "$W/version"
 }
@@ -181,7 +195,7 @@ setup
 awk 'BEGIN{for(i=0;i<40000;i++)printf "%d -90 10 20 100 1725 B3_(1800_MHz)\n",1000000+i}' > "$W/tmp/points"
 FAKE_NOW=1040000 collect
 S=$(wc -c < "$W/etc/points" | tr -d ' ')
-[ "$S" -le 1000000 ] && ok "flash copy capped" || bad "flash copy capped ($S)"
+[ "$S" -le 1050000 ] && ok "flash copy capped" || bad "flash copy capped ($S)"
 tail -n 1 "$W/etc/points" | grep -q '^1040000 ' && ok "cap drops oldest" || bad "cap drops oldest"
 
 setup
@@ -197,13 +211,13 @@ eq "empty history" "$OUT" '{"points":[],"traffic":[]}'
 
 setup
 OUT=$(rpc call info)
-eq "info" "$OUT" '{"version":"0.1.0","sources":["qmodem","ping","traffic"]}'
+eq "info" "$OUT" '{"version":"0.1.0","sources":["qmodem","ping","traffic"],"keep_days":7,"max_days":30,"ping_method":"none"}'
 FAKE_QMODEM=
 OUT=$(rpc call info)
-eq "info without qmodem" "$OUT" '{"version":"0.1.0","sources":["ping","traffic"]}'
+eq "info without qmodem" "$OUT" '{"version":"0.1.0","sources":["ping","traffic"],"keep_days":7,"max_days":30,"ping_method":"none"}'
 
 setup
-case "$(rpc list)" in *'"info"'*'"history"'*) ok "list" ;; *) bad "list" ;; esac
+case "$(rpc list)" in *'"info"'*'"history"'*'"set"'*) ok "list" ;; *) bad "list" ;; esac
 
 setup
 collect
@@ -332,6 +346,138 @@ echo 9999999 > "$W/tmp/flushed"
 rm "$W/etc/points"
 FAKE_NOW=1000120 collect
 [ -s "$W/etc/points" ] && ok "flush when the clock went backwards" || bad "flush when the clock went backwards"
+
+
+setup
+D=86400
+printf '%s\n' "$((1000000-10*D)) -90 10 20 1 2 B1" "$((1000000-D)) -91 11 21 1 2 B1" > "$W/old"
+cp "$W/old" "$W/tmp/points"
+collect
+eq "default keeps 7 days" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "2"
+setup
+printf '%s\n' "$((1000000-8*D)) -90 10 20 1 2 B1" > "$W/tmp/points"
+collect
+eq "default drops 8 day old reading" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "1"
+
+setup; echo 14 > "$W/keep"
+cp "$W/old" "$W/tmp/points"
+collect
+eq "keep_days 14 keeps 10 day old reading" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "3"
+setup; echo 7 > "$W/keep"
+cp "$W/old" "$W/tmp/points"
+collect
+eq "keep_days 7 drops 10 day old reading" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "2"
+
+for v in 0 31 -3 abc 3.5 08 '' 99999999999999999999; do
+	setup; printf '%s\n' "$v" > "$W/keep"
+	cp "$W/old" "$W/tmp/points"
+	collect
+	eq "invalid keep_days '$v' falls back to 7" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "2"
+done
+
+setup
+OUT=$(echo '{"keep_days":0}' | rpc call set)
+eq "set rejects 0" "$OUT" '{"error":"keep_days must be 1-30"}'
+OUT=$(echo '{"keep_days":31}' | rpc call set)
+eq "set rejects 31" "$OUT" '{"error":"keep_days must be 1-30"}'
+OUT=$(echo '{"keep_days":"x"}' | rpc call set)
+eq "set rejects text" "$OUT" '{"error":"keep_days must be 1-30"}'
+OUT=$(echo '{}' | rpc call set)
+eq "set rejects missing value" "$OUT" '{"error":"keep_days must be 1-30"}'
+[ ! -e "$W/keep" ] && ok "rejected set writes nothing" || bad "rejected set writes nothing"
+
+setup
+printf '%s\n' "$((1000000-5*D)) -90 10 20 1 2 B1" "$((1000000-D)) -91 11 21 1 2 B1" > "$W/tmp/points"
+cp "$W/tmp/points" "$W/etc/points"
+OUT=$(echo '{"keep_days":3}' | rpc call set)
+eq "set returns keep_days" "$OUT" '{"keep_days":3}'
+eq "set stored in uci" "$(cat "$W/keep")" "3"
+grep -q '^uci commit keystone-history$' "$W/log" && ok "set commits uci" || bad "set commits uci"
+eq "set prunes ram copy at once" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "1"
+eq "set prunes flash copy at once" "$(wc -l < "$W/etc/points" | tr -d ' ')" "1"
+eq "info shows new keep_days" "$(rpc call info)" '{"version":"0.1.0","sources":["qmodem","ping","traffic"],"keep_days":3,"max_days":30,"ping_method":"none"}'
+
+setup; echo 30 > "$W/keep"
+case "$(rpc call info)" in *'"keep_days":30,"max_days":30,'*) ok "info shows 30" ;; *) bad "info shows 30" ;; esac
+echo 99 > "$W/keep"
+case "$(rpc call info)" in *'"keep_days":7,'*) ok "info invalid keep_days shows 7" ;; *) bad "info invalid keep_days shows 7" ;; esac
+
+capcheck() {
+	setup; echo "$1" > "$W/keep"
+	awk -v n="$2" 'BEGIN{for(i=0;i<n;i++)printf "%d -90 10 20 100 1725 B3_(1800_MHz)\n",1000000+i}' > "$W/tmp/points"
+	FAKE_NOW=$((1000000 + $2)) collect
+	S=$(wc -c < "$W/etc/points" | tr -d ' ')
+	R=$(wc -c < "$W/tmp/points" | tr -d ' ')
+	[ "$S" -le "$3" ] && [ "$S" -gt $(($3 - 100)) ] && [ "$R" -le "$3" ] && ok "$4" || bad "$4 (flash $S ram $R want $3)"
+}
+capcheck 1 40000 1000000 "keep_days 1 cap is 1 MB"
+capcheck 14 70000 2100000 "keep_days 14 cap scales to 2.1 MB"
+capcheck 30 150000 4000000 "keep_days 30 cap stops at 4 MB"
+
+
+setup; FAKE_QMODEM=
+printf '%s\n' '{"rsrp":"-90","pband":"B3 (1800 MHz) @20 MHz"}' > "$W/g5/metrics_m.json"
+collect
+eq "band keeps zeros" "$(cut -d' ' -f7 "$W/tmp/points")" "B3_(1800_MHz)_@20_MHz"
+
+setup
+collect
+eq "icmp method" "$(cat "$W/tmp/method")" "icmp"
+eq "icmp info" "$(rpc call info | sed -n 's/.*\("ping_method":"[a-z]*"\).*/\1/p')" '"ping_method":"icmp"'
+grep -q '^curl' "$W/log" && bad "curl not used when icmp works" || ok "curl not used when icmp works"
+
+setup; export FAKE_PING_FAIL=1 FAKE_CURL=0.0734
+collect
+eq "tcp fallback ms" "$(cut -d' ' -f4 "$W/tmp/points")" "73"
+eq "tcp method" "$(cat "$W/tmp/method")" "tcp"
+eq "tcp info" "$(rpc call info | sed -n 's/.*\("ping_method":"[a-z]*"\).*/\1/p')" '"ping_method":"tcp"'
+grep -q '^curl --interface wwan0_1 -o /dev/null -s -m 3 -w %{time_connect} http://1.1.1.1/$' "$W/log" && ok "curl bound to wan device" || bad "curl bound to wan device: $(grep curl "$W/log")"
+
+setup; export FAKE_PING_FAIL=1 FAKE_CURL=0.000000
+collect
+eq "tcp zero is a dash" "$(cut -d' ' -f4 "$W/tmp/points")" "-"
+
+setup; export FAKE_PING_FAIL=1
+collect
+eq "neither gives dash" "$(cut -d' ' -f4 "$W/tmp/points")" "-"
+eq "none method" "$(cat "$W/tmp/method")" "none"
+
+setup; export FAKE_PING_FAIL=1 FAKE_CURL=0.05 CURL="$W/bin/nocurl"
+collect
+eq "no curl installed" "$(cut -d' ' -f4 "$W/tmp/points")" "-"
+
+setup
+collect
+collect
+eq "same second written once" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "1"
+FAKE_NOW=1000120 collect
+eq "next second written" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "2"
+
+setup
+echo '{"rsrp":"-90","pci":"7","pband":"B3"}' > "$W/g5/metrics_m.json"
+case "$(rpc call info)" in *'"sources":["qmodem","5gmodem","ping"'*) ok "info lists 5gmodem" ;; *) bad "info lists 5gmodem" ;; esac
+
+
+setup; export FAKE_PING_FAIL=1 FAKE_CURL=0.15 FAKE_CURL_RC=28
+collect
+eq "tcp time taken despite curl exit 28" "$(cut -d' ' -f4 "$W/tmp/points")" "150"
+
+setup; export FAKE_PING_FAIL=1 FAKE_CURL=0.1 FAKE_TCP=9.9.9.9
+collect
+grep -q 'http://9.9.9.9/$' "$W/log" && ok "tcp_target from uci" || bad "tcp_target from uci"
+for v in 'a b' 'x;rm' 'http://x' ; do
+	setup; export FAKE_PING_FAIL=1 FAKE_CURL=0.1 FAKE_TCP="$v"
+	collect
+	grep -q 'http://1.1.1.1/$' "$W/log" && ok "invalid tcp_target '$v' uses 1.1.1.1" || bad "invalid tcp_target '$v' uses 1.1.1.1"
+done
+
+setup; FAKE_QMODEM=
+C=$(printf '\001')
+TB=$(printf '\t')
+printf '{"rsrp":"-90","pband":"B3 (1800 MHz) @20 MHz%s%s"}\n' "$C" "$TB" > "$W/g5/metrics_m.json"
+grep -q "$C" "$W/g5/metrics_m.json" && ok "fixture has control chars" || bad "fixture has control chars"
+collect
+eq "control chars stripped, digits kept" "$(cut -d' ' -f7 "$W/tmp/points")" "B3_(1800_MHz)_@20_MHz"
 
 
 for f in keystone-history keystone-history.rpcd keystone-history.init; do

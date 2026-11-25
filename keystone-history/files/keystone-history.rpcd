@@ -1,13 +1,35 @@
 #!/bin/sh
 
 T=${KS_TMP:-/tmp/keystone-history}
+G5=${KS_5G:-/tmp/5gmodem}
 UBUS=${UBUS:-ubus}
+UCI=${UCI:-uci}
+COLLECTOR=${KS_COLLECTOR:-/usr/sbin/keystone-history}
 VERSION=${KS_VERSION_FILE:-/usr/share/keystone-history/version}
 
+valid_days() {
+	case $1 in ''|0*|???*|*[!0-9]*) return 1 ;; esac
+	[ "$1" -le 30 ]
+}
+
 info() {
-	local s=
+	local s= k pm
+	k=$($UCI -q get keystone-history.main.keep_days)
+	valid_days "$k" || k=7
 	$UBUS list qmodem >/dev/null 2>&1 && s='"qmodem",'
-	printf '{"version":"%s","sources":[%s"ping","traffic"]}\n' "$(cat "$VERSION" 2>/dev/null)" "$s"
+	[ -n "$(find "$G5" -name 'metrics_*.json' -mmin -5 2>/dev/null | head -n 1)" ] && s="$s\"5gmodem\","
+	pm=$(cat "$T/method" 2>/dev/null)
+	case $pm in icmp|tcp) ;; *) pm=none ;; esac
+	printf '{"version":"%s","sources":[%s"ping","traffic"],"keep_days":%s,"max_days":30,"ping_method":"%s"}\n' "$(cat "$VERSION" 2>/dev/null)" "$s" "$k" "$pm"
+}
+
+set_days() {
+	local k
+	k=$(sed -n 's/.*"keep_days" *: *"\{0,1\}\([^,}" ]*\).*/\1/p' | head -n 1)
+	valid_days "$k" || { echo '{"error":"keep_days must be 1-30"}'; return; }
+	{ $UCI set keystone-history.main.keep_days="$k" && $UCI commit keystone-history; } >/dev/null 2>&1 || { echo '{"error":"could not save keep_days"}'; return; }
+	$COLLECTOR prune >/dev/null 2>&1
+	printf '{"keep_days":%s}\n' "$k"
 }
 
 history() {
@@ -20,7 +42,7 @@ history() {
 		function n(v) { return v ~ /^-?[0-9.]+$/ ? v : "null" }
 		$1 >= f && $1 <= t {
 			b = "null"
-			if ($7 != "-") { gsub(/[\\"]/, "", $7); gsub(/_/, " ", $7); b = "\"" $7 "\"" }
+			if ($7 != "-") { gsub(/[\\"]/, "", $7); gsub(/[^ -~]/, "", $7); gsub(/_/, " ", $7); b = "\"" $7 "\"" }
 			printf "%s[%s,%s,%s,%s,%s,%s,%s]", sep, $1, n($2), n($3), n($4), n($5), n($6), b
 			sep = ","
 		}
@@ -39,12 +61,13 @@ history() {
 
 case "$1" in
 list)
-	echo '{ "info": {}, "history": { "from": 0, "to": 0 } }'
+	echo '{ "info": {}, "history": { "from": 0, "to": 0 }, "set": { "keep_days": 0 } }'
 	;;
 call)
 	case "$2" in
 	info) info ;;
 	history) history ;;
+	set) set_days ;;
 	esac
 	;;
 esac

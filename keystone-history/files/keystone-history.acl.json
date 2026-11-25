@@ -6,6 +6,11 @@
 				"keystone.history": [ "info", "history" ]
 			},
 			"uci": [ "keystone-history" ]
+		},
+		"write": {
+			"ubus": {
+				"keystone.history": [ "set" ]
+			}
 		}
 	}
 }

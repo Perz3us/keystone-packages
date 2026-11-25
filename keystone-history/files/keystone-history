@@ -7,16 +7,36 @@ SYS=${KS_SYS:-/sys/class/net}
 G5=${KS_5G:-/tmp/5gmodem}
 UBUS=${UBUS:-ubus}
 PING=${PING:-ping}
+CURL=${CURL:-curl}
 UCI=${UCI:-uci}
 DATE=${DATE:-date}
 MINTIME=${KS_MIN_TIME:-1704067200}
-KEEP=604800
-CAP=900000
 
 now=$($DATE +%s)
 [ "$now" -ge "$MINTIME" ] 2>/dev/null || exit 0
 mkdir -p "$T"
 month=$($DATE +%Y-%m)
+
+kd=$($UCI -q get keystone-history.main.keep_days)
+case $kd in ''|0*|???*|*[!0-9]*) kd=7 ;; esac
+[ "$kd" -le 30 ] || kd=7
+cap=$((150000 * kd))
+[ "$cap" -ge 1000000 ] || cap=1000000
+[ "$cap" -le 4000000 ] || cap=4000000
+
+prune() {
+	[ -f "$1" ] || return 0
+	awk -v c=$((now - kd * 86400)) '$1 >= c' "$1" > "$1.new" && mv "$1.new" "$1"
+	if [ "$(wc -c < "$1")" -gt "$cap" ]; then
+		tail -c "$cap" "$1" | sed 1d > "$1.new" && mv "$1.new" "$1"
+	fi
+}
+
+if [ "$mode" = prune ]; then
+	prune "$T/points"
+	prune "$E/points"
+	exit 0
+fi
 
 wan_dev() {
 	$UBUS call network.interface dump 2>/dev/null | awk '
@@ -70,16 +90,27 @@ for v in rsrp sinr pci earfcn band; do
 	eval "x=\$$v"
 	[ -n "$x" ] || eval "$v=-"
 done
-band=$(printf '%s' "$band" | tr -d '"\\001-\037' | tr ' ' '_')
+band=$(printf '%s' "$band" | sed 's/["\]//g; s/[^ -~]//g' | tr ' ' '_')
 [ -n "$band" ] || band=-
 
 target=$($UCI -q get keystone-history.main.ping_target)
 [ -n "$target" ] || target=8.8.8.8
+tcp=$($UCI -q get keystone-history.main.tcp_target)
+case $tcp in ""|*[!A-Za-z0-9.-]*) tcp=1.1.1.1 ;; esac
 ms=$($PING -c 1 -W 2 -I "$dev" "$target" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -n 1)
+method=icmp
+if [ -z "$ms" ]; then
+	method=none
+	if command -v "$CURL" >/dev/null 2>&1; then
+		ms=$($CURL --interface "$dev" -o /dev/null -s -m 3 -w '%{time_connect}' "http://$tcp/" 2>/dev/null | awk '{ m = int($1 * 1000 + 0.5); if (m > 0) print m }')
+		[ -z "$ms" ] || method=tcp
+	fi
+fi
 [ -n "$ms" ] || ms=-
+echo "$method" > "$T/method"
 
-echo "$now $rsrp $sinr $ms $pci $earfcn $band" >> "$T/points"
-awk -v c=$((now - KEEP)) '$1 >= c' "$T/points" > "$T/points.new" && mv "$T/points.new" "$T/points"
+[ "$(tail -n 1 "$T/points" 2>/dev/null | cut -d" " -f1)" = "$now" ] || echo "$now $rsrp $sinr $ms $pci $earfcn $band" >> "$T/points"
+prune "$T/points"
 
 rx=$(cat "$SYS/$dev/statistics/rx_bytes" 2>/dev/null)
 tx=$(cat "$SYS/$dev/statistics/tx_bytes" 2>/dev/null)
@@ -102,11 +133,7 @@ last=0
 since=$((now - last))
 if [ "$mode" = flush ] || [ "$since" -lt 0 ] || [ "$since" -ge 3600 ]; then
 	mkdir -p "$E"
-	if [ "$(wc -c < "$T/points")" -gt "$CAP" ]; then
-		tail -c "$CAP" "$T/points" | sed 1d > "$E/points.new"
-	else
-		cp "$T/points" "$E/points.new"
-	fi
+	cp "$T/points" "$E/points.new"
 	mv "$E/points.new" "$E/points"
 	for t in "$T"/traffic.*; do
 		[ -f "$t" ] && cp "$t" "$E/"
