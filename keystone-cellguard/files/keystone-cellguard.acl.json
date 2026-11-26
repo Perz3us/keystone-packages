@@ -1,0 +1,15 @@
+{
+	"keystone-cellguard": {
+		"description": "Grant access to Keystone cell guard",
+		"read": {
+			"ubus": {
+				"keystone.cellguard": [ "info" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"keystone.cellguard": [ "arm", "disarm", "ack" ]
+			}
+		}
+	}
+}

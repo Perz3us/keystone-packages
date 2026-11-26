@@ -9,6 +9,7 @@ Router packages for the Keystone app, one package per feature. The app talks to 
 | keystone-history | Records signal, ping and traffic history (7 days by default) so the app can draw graphs. |
 | keystone-alerts | Watches for outages, weak signal, new devices and data use, and keeps a small log for the app. Needs keystone-history. |
 | keystone-devices | Adds up the data each device uses per billing period. Needs keystone-history. |
+| keystone-cellguard | Removes a cell lock that leaves the router offline. Needs keystone-history. |
 
 ## keystone-history
 
@@ -94,3 +95,13 @@ Run them from a path without spaces.
 ## License
 
 GPL 3.0
+
+## keystone-cellguard
+
+The app arms it just before it locks a cell. It notes the ping and RSRP of the cell before the lock, then checks the modem every 15 seconds.
+
+For the first 4 minutes it removes the lock if the modem has no internet for 2 minutes, if more than half the checks fail, if the ping is more than twice as slow (and 50 ms slower), or if the signal is 10 dB weaker and at -115 dBm or below. After that it removes the lock only if the modem receives nothing for 5 minutes. A weaker cell that still works is kept, since people lock to quieter towers on purpose.
+
+A check passes on a ping reply, a TCP connect over the modem of 2 ms or more (a faster answer is a local proxy such as Passwall, not the internet), or new bytes received on the modem. Once the trial is over, received data alone is enough, so a working lock costs no extra traffic. If it never saw the internet working, before or after the lock, it leaves the lock alone.
+
+It removes locks with the 5G Modem scripts, then AT commands if those refuse, or QModem. Failed attempts are retried 1, 2, 3 and up to 10 minutes apart. It never locks again by itself. The app reads what happened from the ubus object `keystone.cellguard` (`info`, `arm`, `disarm` and `ack`).

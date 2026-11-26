@@ -1,0 +1,247 @@
+#!/bin/sh
+
+T=${KS_TMP:-/tmp/keystone-cellguard}
+E=${KS_ETC:-/etc/keystone-cellguard}
+UCI=${UCI:-uci}
+DATE=${DATE:-date}
+PING=${PING:-ping}
+CURL=${CURL:-curl}
+HIST=${KS_HIST:-/tmp/keystone-history}
+SYS=${KS_SYS:-/sys/class/net}
+BANDS=${KS_BANDS:-/usr/share/5gmodem/bands.sh}
+ATCMD=${KS_ATCMD:-/usr/share/5gmodem/atcmd.sh}
+SETOPT=${KS_SETOPT:-/usr/share/5gmodem/setopt.sh}
+TRIAL=${KS_TRIAL:-240}
+TRIAL_DOWN=${KS_TRIAL_DOWN:-120}
+WATCH_DOWN=${KS_WATCH_DOWN:-300}
+GRACE=${KS_GRACE:-180}
+EVERY=${KS_EVERY:-15}
+. "${KS_COMMON:-/usr/share/keystone-cellguard/common.sh}" || exit 1
+
+mkdir -p "$T"
+
+now_s() { $DATE +%s; }
+up_s() { cut -d. -f1 "$KS_UPTIME" 2>/dev/null || echo 0; }
+num() { case $1 in ''|*[!0-9]*) return 1 ;; esac; }
+mobile() { case $1 in wwan*|rmnet*|qmimux*|mhi_net*|usb[0-9]*) return 0 ;; esac; return 1; }
+
+targets() {
+	local t
+	[ -n "$KS_TARGETS" ] && { echo "$KS_TARGETS"; return; }
+	t=$($UCI -q get keystone-history.main.ping_target)
+	case $t in ''|*[!A-Za-z0-9.:-]*) t=8.8.8.8 ;; esac
+	[ "$t" = 1.1.1.1 ] && echo 1.1.1.1 8.8.8.8 || echo "$t" 1.1.1.1
+}
+
+moved() {
+	local now last= ldev=
+	now=$(cat "$SYS/$1/statistics/rx_bytes" 2>/dev/null)
+	num "$now" || return 1
+	[ -f "$T/rx" ] && read -r ldev last < "$T/rx"
+	echo "$1 $now" > "$T/rx"
+	[ "$ldev" = "$1" ] && num "$last" && [ "$now" -gt "$last" ]
+}
+
+probe() {
+	local dev= t ms rx=0
+	[ -f "$T/rx" ] && read -r dev t < "$T/rx"
+	[ -n "$dev" ] && [ -f "$SYS/$dev/statistics/rx_bytes" ] || dev=$(ks_wan_dev)
+	[ -n "$dev" ] || return 1
+	[ "$1" = 1 ] && ! mobile "$dev" && return 1
+	moved "$dev" && rx=1
+	[ "$rx" = 1 ] && [ "$2" != ms ] && return 0
+	if [ ! -e "$T/noicmp" ] && ms=$(icmp "$dev"); then echo "$ms"; return 0; fi
+	if ms=$(tcp "$dev"); then
+		: > "$T/noicmp"
+		echo "$ms"
+		return 0
+	fi
+	if [ -e "$T/noicmp" ] && ms=$(icmp "$dev"); then
+		rm -f "$T/noicmp"
+		echo "$ms"
+		return 0
+	fi
+	[ "$rx" = 1 ]
+}
+
+icmp() {
+	local t
+	t=$(targets)
+	t=$($PING -c 1 -W 2 -I "$1" "${t%% *}" 2>/dev/null | sed -n 's/.*time=\([0-9]*\).*/\1/p' | head -n 1)
+	[ -n "$t" ] && echo "$t"
+}
+
+tcp() {
+	local t ms
+	command -v "$CURL" >/dev/null 2>&1 || return 1
+	t=$($UCI -q get keystone-history.main.tcp_target)
+	case $t in ''|*[!A-Za-z0-9.-]*) t=1.1.1.1 ;; esac
+	[ "$t" = 1.0.0.1 ] && t=1.1.1.1
+	for t in $t 1.0.0.1; do
+		ms=$($CURL --interface "$1" -o /dev/null -s -m 2 -w '%{time_connect}' "http://$t/" 2>/dev/null | awk '{ m = int($1 * 1000 + 0.5); if (m >= 2) print m }')
+		[ -n "$ms" ] && { echo "$ms"; return 0; }
+	done
+	return 1
+}
+
+same() {
+	local w p
+	[ -s "$E/lock" ] && read -r w _ p _ < "$E/lock" && [ "$w" = "$L_WALL" ] && [ "$p" = "$L_PCI" ]
+}
+
+median() {
+	[ $# -gt 0 ] || return 0
+	printf '%s\n' "$@" | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }'
+}
+
+baseline_ms() {
+	local i ms all=
+	for i in 1 2 3; do
+		ms=$(probe "$1" ms) || break
+		all="$all $ms"
+	done
+	median $all
+}
+
+load() {
+	[ -s "$E/lock" ] || return 1
+	read -r L_WALL L_UP L_PCI L_ARFCN L_RAT L_MOB L_MS L_RSRP L_PHASE < "$E/lock"
+	num "$L_PCI" && num "$L_ARFCN" && num "$L_UP"
+}
+
+save() {
+	mkdir -p "$E"
+	echo "$L_WALL $L_UP $L_PCI $L_ARFCN $L_RAT $L_MOB $L_MS $L_RSRP $L_PHASE" > "$E/lock.new" && mv "$E/lock.new" "$E/lock"
+}
+
+forget() { rm -f "$E/lock" "$T/run" "$T/ms" "$T/failing"; }
+
+arm() {
+	local line t v
+	num "$1" && num "$2" || return 1
+	case $3 in lte|nr) ;; *) return 1 ;; esac
+	L_MOB=0
+	mobile "$(ks_wan_dev)" && L_MOB=1
+	L_MS=$(baseline_ms "$L_MOB")
+	L_MS=${L_MS:--}
+	L_RSRP=-
+	line=$(tail -n 1 "$HIST/points" 2>/dev/null)
+	t=${line%% *}
+	if num "$t" && [ $(($(now_s) - t)) -le 300 ]; then
+		v=$(printf '%s\n' "$line" | cut -d' ' -f2 | cut -d. -f1)
+		case $v in -[0-9]*) L_RSRP=$v ;; esac
+	fi
+	forget
+	L_WALL=$(now_s) L_UP=$(up_s) L_PCI=$1 L_ARFCN=$2 L_RAT=$3 L_PHASE=trial
+	save
+}
+
+at5g() { "$ATCMD" "$1" "$2" 2>/dev/null | grep -q '^[[:space:]]*OK[[:space:]]*$'; }
+
+unlock_at() {
+	local s act name port
+	s=$($UCI -q show 5gmodem | sed -n "s/^5gmodem\.\([^.]*\)\.active_modem='\{0,1\}\([^']*\)'\{0,1\}$/\1 \2/p" | head -n 1)
+	[ -n "$s" ] || return 1
+	act=${s#* }
+	s=${s%% *}
+	name=m_$(printf '%s' "$act" | sed 's/[^A-Za-z0-9]/_/g')
+	port=$($UCI -q get "5gmodem.$name.at_port" || $UCI -q get "5gmodem.$s.at_port" || $UCI -q get "5gmodem.$s.device")
+	[ -n "$port" ] || return 1
+	at5g "$port" 'AT+QNWLOCK="common/4g",0' || at5g "$port" 'AT+QNWLOCK="common/lte",0' || return 1
+	if [ -n "$($UCI -q get "5gmodem.$name.celllock")" ]; then
+		$UCI -q set "5gmodem.$name.celllock=" && $UCI -q commit 5gmodem
+	fi
+	at5g "$port" 'AT+QNWLOCK="common/5g",0'
+	at5g "$port" 'AT+QNWLOCK="save_ctrl",1,1'
+	"$SETOPT" reconnect >/dev/null 2>&1
+	return 0
+}
+
+unlock() {
+	local r sec
+	if [ -x "$BANDS" ]; then
+		"$BANDS" setcelllock off >/dev/null 2>&1
+		r=$?
+		"$BANDS" setcelllock5g off >/dev/null 2>&1
+		[ "$r" = 0 ] && return 0
+		unlock_at
+		return
+	fi
+	$UBUS list qmodem >/dev/null 2>&1 || return 1
+	sec=$(ks_qmodem_section)
+	[ -n "$sec" ] || return 1
+	$UBUS call qmodem set_neighborcell "{\"config_section\":\"$sec\",\"params\":{\"rat\":\"0\",\"pci\":\"\",\"arfcn\":\"\",\"band\":\"\",\"scs\":\"\",\"en_boot_hook\":\"0\"}}" >/dev/null 2>&1
+}
+
+revert() {
+	same || return 0
+	if ! unlock; then
+		local n=0 w
+		[ -f "$T/failing" ] && read -r _ _ n < "$T/failing"
+		num "$n" || n=0
+		n=$((n + 1))
+		w=$((60 * n))
+		[ "$w" -le 600 ] || w=600
+		echo "$1 $(($(up_s) + w)) $n" > "$T/failing"
+		return 1
+	fi
+	mkdir -p "$E"
+	printf '{"time":%s,"reason":"%s","pci":%s,"earfcn":%s,"nr":%s}\n' "$(now_s)" "$1" "$L_PCI" "$L_ARFCN" "$([ "$L_RAT" = nr ] && echo true || echo false)" > "$E/last.new" && mv "$E/last.new" "$E/last"
+	forget
+}
+
+judge() {
+	local med rsrp
+	if [ $(($1 * 2)) -lt $(($1 + $2)) ] && { num "$L_MS" || [ "$1" -gt 0 ]; }; then revert unstable; return; fi
+	med=$(median $(cat "$T/ms" 2>/dev/null))
+	if num "$L_MS" && num "$med" && [ "$med" -gt $((L_MS * 2)) ] && [ "$med" -gt $((L_MS + 50)) ]; then revert slow; return; fi
+	rsrp=$(awk -v s="$L_WALL" -v p="$L_PCI" '$1 >= s && $5 == p { v = $2 } END { print v }' "$HIST/points" 2>/dev/null | cut -d. -f1)
+	case $L_RSRP in -[0-9]*)
+		case $rsrp in -[0-9]*) [ "$rsrp" -lt $((L_RSRP - 10)) ] && [ "$rsrp" -le -115 ] && { revert weak; return; } ;; esac ;;
+	esac
+	same || return 0
+	L_PHASE=watch
+	save
+	rm -f "$T/ms"
+}
+
+tick() {
+	local up ok=0 fail=0 down=0 ms
+	load || return 0
+	up=$(up_s)
+	if [ -f "$T/failing" ]; then
+		read -r _ ms _ < "$T/failing"
+		num "$ms" && [ "$up" -lt "$ms" ] && return 0
+	fi
+	[ -f "$T/run" ] && read -r ok fail down < "$T/run"
+	if ms=$(probe "$L_MOB" "$([ "$L_PHASE" = trial ] && echo ms)"); then
+		ok=$((ok + 1))
+		down=0
+		[ "$L_PHASE" = trial ] && echo "$ms" >> "$T/ms"
+	elif [ "$up" -ge "$GRACE" ]; then
+		fail=$((fail + 1))
+		[ "$down" = 0 ] && down=$up
+	fi
+	echo "$ok $fail $down" > "$T/run"
+	if [ "$down" != 0 ] && { num "$L_MS" || [ "$ok" -gt 0 ]; }; then
+		[ "$L_PHASE" = trial ] && [ $((up - down)) -ge "$TRIAL_DOWN" ] && { revert no_service; return 0; }
+		[ "$L_PHASE" = watch ] && [ $((up - down)) -ge "$WATCH_DOWN" ] && { revert lost; return 0; }
+	fi
+	[ "$L_PHASE" = trial ] && [ $((up - L_UP)) -ge "$TRIAL" ] && judge "$ok" "$fail"
+	return 0
+}
+
+[ -n "$KS_GUARD_LIB" ] && return 0
+
+case "$1" in
+tick) tick ;;
+run)
+	if load; then
+		L_UP=$(up_s)
+		save
+	fi
+	while :; do
+		tick
+		sleep "$EVERY"
+	done ;;
+esac

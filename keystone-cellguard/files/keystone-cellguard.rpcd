@@ -1,0 +1,39 @@
+#!/bin/sh
+
+DAEMON=${KS_DAEMON:-/usr/sbin/keystone-cellguard}
+VERSION=${KS_VERSION_FILE:-/usr/share/keystone-cellguard/version}
+[ -f "$DAEMON" ] || DAEMON=$(dirname "$0")/keystone-cellguard
+[ -f "$DAEMON" ] || exit 1
+KS_GUARD_LIB=1
+. "$DAEMON"
+
+val() { printf '%s' "$2" | tr -d '\n' | sed -n "s/.*\"$1\" *: *\"\{0,1\}\([^,\"}]*\).*/\1/p"; }
+
+info() {
+	local lock=null last=null phase
+	if load; then
+		phase=$L_PHASE
+		[ -f "$T/failing" ] && phase=removing
+		lock=$(printf '{"pci":%s,"earfcn":%s,"nr":%s,"phase":"%s","since":%s}' "$L_PCI" "$L_ARFCN" "$([ "$L_RAT" = nr ] && echo true || echo false)" "$phase" "$L_WALL")
+	fi
+	[ -s "$E/last" ] && last=$(cat "$E/last")
+	printf '{"version":"%s","lock":%s,"last":%s}\n' "$(cat "$VERSION" 2>/dev/null)" "$lock" "$last"
+}
+
+case "$1" in
+list)
+	echo '{ "info": {}, "arm": { "pci": "", "arfcn": "", "nr": false }, "disarm": {}, "ack": {} }'
+	;;
+call)
+	case "$2" in
+	info) info ;;
+	arm)
+		in=$(head -c 400)
+		case $(val nr "$in") in true|1) rat=nr ;; *) rat=lte ;; esac
+		if arm "$(val pci "$in")" "$(val arfcn "$in")" "$rat"; then info; else echo '{"error":"pci and arfcn must be numbers"}'; fi
+		;;
+	disarm) forget; info ;;
+	ack) rm -f "$E/last"; info ;;
+	esac
+	;;
+esac
