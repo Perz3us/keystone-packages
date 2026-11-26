@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/sbin/keystone-alerts run
+	procd_set_param file /etc/config/keystone-alerts
+	procd_set_param respawn 3600 10 0
+	procd_close_instance
+}
+
+stop_service() {
+	/usr/sbin/keystone-alerts flush
+}
+
+service_triggers() {
+	procd_add_reload_trigger keystone-alerts
+}

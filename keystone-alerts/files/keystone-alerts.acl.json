@@ -1,0 +1,24 @@
+{
+	"unauthenticated": {
+		"description": "Signed alert checks from phones that hold the alerts key",
+		"read": {
+			"ubus": {
+				"keystone.alerts": [ "feed" ]
+			}
+		}
+	},
+	"keystone-alerts": {
+		"description": "Grant access to Keystone alerts",
+		"read": {
+			"ubus": {
+				"keystone.alerts": [ "info", "events" ]
+			},
+			"uci": [ "keystone-alerts" ]
+		},
+		"write": {
+			"ubus": {
+				"keystone.alerts": [ "set", "clear", "pair", "reset_key" ]
+			}
+		}
+	}
+}

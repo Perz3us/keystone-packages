@@ -1,0 +1,382 @@
+#!/bin/sh
+# Keystone alerts: watches the connection and keeps a small event log for the app.
+
+T=${KS_TMP:-/tmp/keystone-alerts}
+E=${KS_ETC:-/etc/keystone-alerts}
+UCI=${UCI:-uci}
+DATE=${DATE:-date}
+MINTIME=${KS_MIN_TIME:-1704067200}
+UPTIME_FILE=${KS_UPTIME:-/proc/uptime}
+PING=${PING:-ping}
+CURL=${CURL:-curl}
+IP=${IP:-ip}
+SYS=${KS_SYS:-/sys/class/net}
+LEASES=${KS_LEASES:-/tmp/dhcp.leases}
+HIST=${KS_HIST:-/tmp/keystone-history}
+BOOT_FILE=${KS_BOOT_ID:-/proc/sys/kernel/random/boot_id}
+MAX_EVENTS=${KS_MAX_EVENTS:-500}
+MAX_AGE=$((30 * 86400))
+MAX_BYTES=100000
+TAB=$(printf '\t')
+. "${KS_COMMON:-/usr/share/keystone-alerts/common.sh}" || exit 1
+
+# State in run/ is for this boot only, so it is never copied to flash.
+R="$T/run"
+mkdir -p "$R"
+
+# setting <type> <key> <default>
+setting() {
+	local v
+	v=$($UCI -q get keystone-alerts.$1.$2)
+	echo "${v:-$3}"
+}
+
+mode() {
+	local m
+	m=$(setting "$1" mode "$2")
+	case $m in buzz|log|off) echo "$m" ;; *) echo "$2" ;; esac
+}
+
+# range <value> <min> <max>
+range() {
+	case $1 in ''|-|*[!0-9-]*|?*-*) return 1 ;; esac
+	[ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+# nset <type> <key> <default> <min> <max>: a number setting, default when missing or wrong
+nset() {
+	local v
+	v=$(setting "$1" "$2" "$3")
+	range "$v" "$4" "$5" && echo "$v" || echo "$3"
+}
+
+now_s() { $DATE +%s; }
+uptime_s() { cut -d. -f1 "$UPTIME_FILE" 2>/dev/null || echo 0; }
+boot_id() { cat "$BOOT_FILE" 2>/dev/null || echo unknown; }
+
+# The clock counts as right once the internet has been up for two minutes (time to sync).
+clock_ok() {
+	local on
+	[ "$(now_s)" -ge "$MINTIME" ] 2>/dev/null || return 1
+	on=$(cat "$R/online" 2>/dev/null)
+	[ -n "$on" ] && [ $(($(uptime_s) - on)) -ge 120 ]
+}
+
+# Event lines: id type start end clock_ok boot uptime detail (tab separated)
+ev_add() {
+	local id now start ok=0
+	id=$(cat "$T/next_id" 2>/dev/null)
+	case $id in ''|*[!0-9]*) id=1 ;; esac
+	now=$(now_s)
+	start=$2
+	[ "$start" = - ] && start=$now
+	clock_ok && ok=1
+	printf '%s\t%s\t%s\t-\t%s\t%s\t%s\t%s\n' "$id" "$1" "$start" "$ok" "$(boot_id)" "$(($(uptime_s) - now + start))" "$3" >> "$T/events"
+	echo $((id + 1)) > "$T/next_id"
+	echo "$id"
+}
+
+# ev_set <id> <field number> <value>
+ev_set() {
+	[ -f "$T/events" ] || return 0
+	awk -F "$TAB" -v OFS="$TAB" -v id="$1" -v f="$2" -v v="$3" '$1 == id { $f = v } { print }' "$T/events" > "$T/events.new" && mv "$T/events.new" "$T/events"
+}
+ev_end() { ev_set "$1" 4 "$2"; }
+
+ev_trim() {
+	[ -f "$T/events" ] || return 0
+	local now
+	now=$(now_s)
+	# Events stamped before the clock was set can't be aged, so only the count limit drops them.
+	awk -F "$TAB" -v c=$((now - MAX_AGE)) -v min="$MINTIME" -v ok=$([ "$now" -ge "$MINTIME" ] && echo 1 || echo 0) \
+		'!ok || $3 < min || $3 >= c' "$T/events" | tail -n "$MAX_EVENTS" > "$T/events.new" && mv "$T/events.new" "$T/events"
+}
+
+flush() {
+	ks_flush "$T" "$E" "$T/flushed" "$1" "$(now_s)"
+	if [ -f "$E/events" ] && [ "$(wc -c < "$E/events")" -gt "$MAX_BYTES" ]; then
+		tail -c "$MAX_BYTES" "$E/events" | sed 1d > "$E/events.new" && mv "$E/events.new" "$E/events"
+	fi
+}
+
+# Bring the log back from flash after a boot. Up to an hour of it may be lost, so the
+# ids jump ahead: reusing one would make a phone skip an event.
+restore() {
+	local f n id
+	[ -e "$T/next_id" ] && return 0
+	for f in "$E"/*; do
+		case ${f##*/} in boot|key) continue ;; esac
+		[ -f "$f" ] && cp "$f" "$T/"
+	done
+	n=$(cat "$T/next_id" 2>/dev/null)
+	case $n in ''|*[!0-9]*) return 0 ;; esac
+	echo $((n + 1000)) > "$T/next_id"
+	now_s > "$T/flushed"
+	id=$(open_event internet)
+	[ -n "$id" ] && echo "down 0 0 0 $id -" > "$R/net"
+	id=$(open_event signal)
+	[ -n "$id" ] && echo "low 0 $id" > "$R/sig"
+	return 0
+}
+
+open_event() { awk -F "$TAB" -v t="$1" '$2 == t && $4 == "-" { id = $1 } END { print id }' "$T/events" 2>/dev/null; }
+
+# When the wall clock jumps against the uptime (NTP sync), move this boot's events with it.
+watch_clock() {
+	local off prev d
+	off=$(($(now_s) - $(uptime_s)))
+	prev=$(cat "$R/off" 2>/dev/null)
+	echo "$off" > "$R/off"
+	[ -f "$T/events" ] || return 0
+	d=0
+	if [ -n "$prev" ]; then
+		d=$((off - prev))
+		[ "$d" -gt 60 ] || [ "$d" -lt -60 ] || d=0
+	fi
+	if [ "$d" != 0 ] || { [ ! -e "$R/trusted" ] && clock_ok; }; then
+		awk -F "$TAB" -v OFS="$TAB" -v b="$(boot_id)" -v d="$d" -v ok="$([ "$(now_s)" -ge "$MINTIME" ] && echo 1 || echo 0)" '
+			$6 == b { $3 = sprintf("%.0f", $3 + d); if ($4 != "-") $4 = sprintf("%.0f", $4 + d); $5 = ok }
+			{ print }' "$T/events" > "$T/events.new" && mv "$T/events.new" "$T/events"
+		clock_ok && : > "$R/trusted"
+	fi
+}
+
+watch_restart() {
+	local b old dev i
+	b=$(boot_id)
+	old=$(cat "$E/boot" 2>/dev/null)
+	if [ "$b" != "$old" ]; then
+		mkdir -p "$E"
+		echo "$b" > "$E/boot"
+		[ -n "$old" ] && [ "$(mode restart log)" != off ] && ev_add restart - '{"what":"router"}' >/dev/null && : > "$R/urgent"
+	fi
+	# A modem that restarts comes back as a new network device. Reconnecting only renews
+	# the wwan0_1 style devices on top of it, so look at the base one.
+	dev=$(ks_wan_dev)
+	dev=${dev%%_*}
+	case $dev in wwan[0-9]*|usb[0-9]*) ;; *) return 0 ;; esac
+	i=$(cat "$SYS/$dev/ifindex" 2>/dev/null)
+	[ -n "$i" ] || return 0
+	old=$(cat "$R/modem" 2>/dev/null)
+	echo "$dev $i" > "$R/modem"
+	[ -n "$old" ] && [ "${old% *}" = "$dev" ] && [ "$old" != "$dev $i" ] && [ "$(mode restart log)" != off ] && ev_add restart - '{"what":"modem"}' >/dev/null
+	return 0
+}
+
+net_ok() {
+	local dev target tcp ms
+	dev=$(ks_wan_dev)
+	target=$(setting main ping_target "$($UCI -q get keystone-history.main.ping_target)")
+	target=${target:-8.8.8.8}
+	[ -n "$dev" ] && $PING -c 1 -W 2 -I "$dev" "$target" >/dev/null 2>&1 && return 0
+	# Not over the mobile line, but another line may have taken over.
+	$PING -c 1 -W 2 "$target" >/dev/null 2>&1 && return 0
+	[ -n "$dev" ] && command -v "$CURL" >/dev/null 2>&1 || return 1
+	tcp=$($UCI -q get keystone-history.main.tcp_target)
+	case $tcp in ''|*[!A-Za-z0-9.-]*) tcp=1.1.1.1 ;; esac
+	ms=$($CURL --interface "$dev" -o /dev/null -s -m 3 -w '%{time_connect}' "http://$tcp/" 2>/dev/null)
+	awk -v m="$ms" 'BEGIN { exit !(m + 0 > 0) }'
+}
+
+# run/net: state fails successes since id last_end (times in uptime seconds)
+watch_internet() {
+	local up now st=up f=0 k=0 since=0 id=- end=- n
+	up=$(uptime_s); now=$(now_s)
+	[ -f "$R/net" ] && read -r st f k since id end < "$R/net"
+	if [ "$(mode internet buzz)" = off ]; then
+		[ "$st" = down ] && [ "$id" != - ] && ev_end "$id" "$now"
+		rm -f "$R/net"
+		# Still needed to know when the clock can be trusted.
+		[ -e "$R/online" ] || { net_ok && echo "$up" > "$R/online"; }
+		return 0
+	fi
+	if net_ok; then
+		[ -e "$T/ever_up" ] || : > "$T/ever_up"
+		[ -e "$R/online" ] || echo "$up" > "$R/online"
+		f=0
+		if [ "$st" = down ]; then
+			k=$((k + 1))
+			[ "$k" = 1 ] && since=$up
+			if [ "$k" -ge 2 ]; then
+				ev_end "$id" $((now - up + since))
+				: > "$R/urgent"
+				st=up; k=0; end=$since
+			fi
+		fi
+	else
+		k=0
+		# The modem needs a while to connect after boot, and a router that was never
+		# online has nothing to report.
+		if [ "$st" = up ] && { [ "$up" -lt 180 ] || [ ! -e "$T/ever_up" ]; }; then
+			f=0
+		elif [ "$st" = up ]; then
+			f=$((f + 1))
+			[ "$f" = 1 ] && since=$up
+			if [ "$f" -ge 3 ]; then
+				if [ "$end" != - ] && [ $((since - end)) -lt 120 ]; then
+					n=$(awk -F "$TAB" -v id="$id" '$1 == id { gsub(/[^0-9]/, "", $8); print $8 }' "$T/events" 2>/dev/null)
+					ev_set "$id" 4 -
+					ev_set "$id" 8 "{\"drops\":$((${n:-1} + 1))}"
+				else
+					id=$(ev_add internet $((now - up + since)) '{"drops":1}')
+				fi
+				: > "$R/urgent"
+				st=down; f=0
+			fi
+		fi
+	fi
+	echo "$st $f $k $since $id $end" > "$R/net"
+}
+
+# run/sig: state since id
+watch_signal() {
+	local up now st=ok since=0 id=- t v thr line
+	up=$(uptime_s); now=$(now_s)
+	[ -f "$R/sig" ] && read -r st since id < "$R/sig"
+	if [ "$(mode signal log)" = off ]; then
+		[ "$st" = low ] && ev_end "$id" "$now"
+		rm -f "$R/sig"
+		return 0
+	fi
+	thr=$(nset signal rsrp_below -110 -140 -60)
+	line=$(tail -n 1 "$HIST/points" 2>/dev/null)
+	t=${line%% *}
+	v=$(echo "$line" | cut -d' ' -f2 | cut -d. -f1)
+	case $t in ''|*[!0-9]*) t=0 ;; esac
+	if [ $((now - t)) -gt 300 ] || ! range "$v" -200 0; then
+		since=0
+	elif [ "$st" = ok ]; then
+		if [ "$v" -lt "$thr" ]; then
+			[ "$since" = 0 ] && since=$up
+			if [ $((up - since)) -ge 300 ]; then
+				id=$(ev_add signal $((now - up + since)) "{\"rsrp\":$v,\"threshold\":$thr}")
+				st=low; since=0
+			fi
+		else
+			since=0
+		fi
+	elif [ "$v" -ge $((thr + 3)) ]; then
+		[ "$since" = 0 ] && since=$up
+		if [ $((up - since)) -ge 300 ]; then
+			ev_end "$id" "$now"
+			st=ok; since=0
+		fi
+	else
+		since=0
+	fi
+	echo "$st $since $id" > "$R/sig"
+}
+
+watch_device() {
+	local first=0 mac ip name n=0
+	{
+		awk 'NF >= 4 { print tolower($2), $3, $4 }' "$LEASES" 2>/dev/null
+		$IP neigh show 2>/dev/null | awk '$2 == "dev" && $3 ~ /^br-/ && $4 == "lladdr" && $NF == "REACHABLE" { print tolower($5), $1, "*" }'
+	} | awk 'length($1) == 17 && $1 ~ /^[0-9a-f:]+$/ && !s[$1]++' > "$R/seen"
+	[ -f "$T/known_macs" ] || { first=1; : > "$T/known_macs"; }
+	awk 'FNR == NR && FILENAME == ARGV[1] { k[$1] = 1; next } !($1 in k)' "$T/known_macs" "$R/seen" > "$R/new"
+	[ -s "$R/new" ] || return 0
+	cut -d' ' -f1 "$R/new" >> "$T/known_macs"
+	if [ "$first" = 0 ] && [ "$(mode device buzz)" != off ]; then
+		# A flood of made-up addresses must not push everything else out of the log.
+		while read -r mac ip name; do
+			n=$((n + 1))
+			[ "$n" -le 5 ] || break
+			[ "$name" = '*' ] && name=
+			ev_add device - "{\"mac\":\"$mac\",\"ip\":$(ks_json_str "$ip"),\"name\":$(ks_json_str "$name")}" >/dev/null
+		done < "$R/new"
+	fi
+	tail -n 2000 "$T/known_macs" > "$R/known" && mv "$R/known" "$T/known_macs"
+}
+
+# The plan of the SIM in use, as the inside of a JSON object.
+active_plan() {
+	local info sim
+	info=$($UBUS call keystone.history info 2>/dev/null | tr -d ' \t\n')
+	sim=$(echo "$info" | sed -n 's/.*"active_sim":"\([0-9A-Za-z]*\)".*/\1/p')
+	[ -n "$sim" ] && echo "$info" | tr '{' '\n' | grep "^\"sim\":\"$sim\"," | head -n 1 | sed 's/}.*//'
+}
+
+# data_sent.<sim>: period:plan:allowance level...
+watch_data() {
+	local up last sim plan key sent level pct out f
+	[ "$(mode data buzz)" = off ] && return 0
+	[ "$(now_s)" -ge "$MINTIME" ] 2>/dev/null || return 0
+	up=$(uptime_s)
+	last=$(cat "$R/data" 2>/dev/null)
+	[ -n "$last" ] && [ $((up - last)) -lt 300 ] && return 0
+	echo "$up" > "$R/data"
+	plan=$(active_plan)
+	[ -n "$plan" ] || return 0
+	sim=$(echo "$plan" | sed -n 's/^"sim":"\([0-9A-Za-z]*\)".*/\1/p')
+	set -- $(echo "$plan" | sed -n 's/.*"plan":"\([a-z]*\)","allowance_gb":\([0-9]*\),"billing_day":[0-9]*,"period_start":"\([0-9-]*\)","period_end":"\([0-9-]*\)","down":\([0-9]*\),"up":\([0-9]*\).*/\1 \2 \3 \4 \5 \6/p')
+	[ $# = 6 ] && [ "$2" -gt 0 ] || return 0
+	key="$3:$1:$2"
+	f="$T/data_sent.$sim"
+	sent=$(sed -n "s/^$key//p" "$f" 2>/dev/null)
+	set -- $(awk -v plan="$1" -v gb="$2" -v s="$3" -v e="$4" -v used="$(($5 + $6))" -v today="$($DATE +%F)" \
+		-v warn="$(nset data warn_pct 80 50 99)" -v fair="$(nset data fairuse_pct 90 50 99)" '
+		function days(str,  a, y, m) {
+			split(str, a, "-"); y = a[1] + 0; m = a[2] + 0
+			if (m <= 2) { y--; m += 12 }
+			return 365 * y + int(y / 4) - int(y / 100) + int(y / 400) + int((153 * (m - 3) + 2) / 5) + a[3]
+		}
+		function dim(y, m) { return m == 2 ? ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 29 : 28) : (m == 4 || m == 6 || m == 9 || m == 11 ? 30 : 31) }
+		function plus(str, n,  a, y, m, d) {
+			split(str, a, "-"); y = a[1] + 0; m = a[2] + 0; d = a[3] + n
+			while (d > dim(y, m)) { d -= dim(y, m); m++; if (m > 12) { m = 1; y++ } }
+			return sprintf("%04d-%02d-%02d", y, m, d)
+		}
+		BEGIN {
+			lim = gb * 1e9; pct = int(used * 100 / lim); level = "none"; out = "-"
+			if (plan == "fairuse") { if (pct >= fair) level = "fairuse" }
+			else if (plan == "capped") {
+				d = days(today) - days(s) + 1; total = days(e) - days(s) + 1
+				if (pct >= 100) level = "full"
+				else if (pct >= warn) level = "warn"
+				else if (d >= 3 && used > 0) {
+					n = lim * d / used; c = int(n); if (c < n) c++
+					if (c < total) { level = "pace"; out = plus(s, c - 1) }
+				}
+			}
+			print level, pct, out
+		}')
+	level=$1 pct=$2 out=$3
+	[ "$level" = none ] && return 0
+	[ "$out" = - ] && out=
+	case " $sent " in *" $level "*|*" full "*) return 0 ;; esac
+	[ "$level" = pace ] && case " $sent " in *" warn "*) return 0 ;; esac
+	ev_add data - "{\"sim\":\"$sim\",\"level\":\"$level\",\"pct\":$pct,\"runs_out\":\"$out\"}" >/dev/null
+	echo "$key$sent $level" > "$f"
+}
+
+tick() {
+	watch_clock
+	watch_restart
+	watch_internet
+	watch_signal
+	watch_device
+	watch_data
+	ev_trim
+	# Outages and restarts must survive a power cut, so they go to flash at once. They
+	# are rare, so the extra writes don't matter.
+	if [ -e "$R/urgent" ]; then
+		rm -f "$R/urgent"
+		flush 1
+	fi
+}
+
+[ -n "$KS_ALERTS_LIB" ] && return 0
+
+case "$1" in
+flush) flush 1 ;;
+tick) tick ;;
+restore) restore ;;
+run)
+	restore
+	while :; do
+		tick
+		flush 0
+		sleep "$(nset main check_secs 30 10 3600)"
+	done ;;
+esac

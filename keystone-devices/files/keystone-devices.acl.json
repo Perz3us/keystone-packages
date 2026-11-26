@@ -1,0 +1,10 @@
+{
+	"keystone-devices": {
+		"description": "Grant access to Keystone per-device data use",
+		"read": {
+			"ubus": {
+				"keystone.devices": [ "info", "usage" ]
+			}
+		}
+	}
+}

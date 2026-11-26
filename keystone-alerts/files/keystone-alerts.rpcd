@@ -1,0 +1,152 @@
+#!/bin/sh
+
+DAEMON=${KS_DAEMON:-/usr/sbin/keystone-alerts}
+VERSION=${KS_VERSION_FILE:-/usr/share/keystone-alerts/version}
+[ -f "$DAEMON" ] || DAEMON=$(dirname "$0")/keystone-alerts
+[ -f "$DAEMON" ] || exit 1
+KS_ALERTS_LIB=1
+. "$DAEMON"
+
+newest() {
+	local n
+	n=$(cat "$T/next_id" 2>/dev/null)
+	case $n in ''|*[!0-9]*) n=1 ;; esac
+	echo $((n - 1))
+}
+
+oldest() {
+	local o
+	o=$(head -n 1 "$T/events" 2>/dev/null | cut -f1)
+	echo "${o:-$(($(newest) + 1))}"
+}
+
+settings_json() {
+	printf '"internet":{"mode":"%s"},' "$(mode internet buzz)"
+	printf '"signal":{"mode":"%s","rsrp_below":%s},' "$(mode signal log)" "$(nset signal rsrp_below -110 -140 -60)"
+	printf '"device":{"mode":"%s"},' "$(mode device buzz)"
+	printf '"data":{"mode":"%s","warn_pct":%s,"fairuse_pct":%s},' "$(mode data buzz)" "$(nset data warn_pct 80 50 99)" "$(nset data fairuse_pct 90 50 99)"
+	printf '"restart":{"mode":"%s"}' "$(mode restart log)"
+}
+
+info() {
+	printf '{"version":"%s","newest":%s,"oldest":%s,"key_id":"%s","settings":{%s}}\n' "$(cat "$VERSION" 2>/dev/null)" "$(newest)" "$(oldest)" "$(key_id)" "$(settings_json)"
+}
+
+# events_json <since>: the inside of a JSON object
+events_json() {
+	local o tr=false
+	o=$(oldest)
+	[ "$1" -gt 0 ] && [ "$1" -lt $((o - 1)) ] && tr=true
+	printf '"events":['
+	awk -F "$TAB" -v s="$1" '
+		$1 > s && n < 100 {
+			printf "%s{\"id\":%s,\"type\":\"%s\",\"start\":%s,\"end\":%s,\"approx\":%s,\"detail\":%s}", sep, $1, $2, $3, ($4 == "-" ? "null" : $4), ($5 == "1" ? "false" : "true"), ($8 == "" ? "{}" : $8)
+			sep = ","; n++
+		}' "$T/events" 2>/dev/null
+	printf '],"trimmed":%s,"newest":%s' "$tr" "$(newest)"
+}
+
+events() {
+	local since
+	since=$(sed -n 's/.*"since" *: *"\{0,1\}\([0-9][0-9]*\).*/\1/p' | head -n 1)
+	printf '{%s}\n' "$(events_json "${since:-0}")"
+}
+
+# A phone proves it holds the key without sending it, so background checks need no login
+# and give nothing away to other networks. The answer is signed the same way.
+KEY="$E/key"
+sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+new_key() {
+	mkdir -p "$E"
+	( umask 077; head -c 32 /dev/urandom | sha256sum | cut -c1-32 > "$KEY.new" ) && mv "$KEY.new" "$KEY"
+}
+
+key_id() { [ -s "$KEY" ] && sha "$(cat "$KEY")" | cut -c1-8; }
+
+pair() {
+	[ -s "$KEY" ] || new_key
+	printf '{"key":"%s"}\n' "$(cat "$KEY")"
+}
+
+state_json() {
+	local on=null v=null s=null b=null bs=null line t plan
+	case $(cut -d' ' -f1 "$R/net" 2>/dev/null) in up) on=true ;; down) on=false ;; esac
+	line=$(tail -n 1 "$HIST/points" 2>/dev/null)
+	t=${line%% *}
+	case $t in ''|*[!0-9]*) t=0 ;; esac
+	if [ $(($(now_s) - t)) -le 300 ]; then
+		v=$(echo "$line" | cut -d' ' -f2 | cut -d. -f1)
+		range "$v" -200 0 || v=null
+		s=$(echo "$line" | cut -d' ' -f3 | cut -d. -f1)
+		range "$s" -50 60 || s=null
+		# Column 7 is the main band with _ for spaces; column 8, from newer history, is B3+B1+...
+		b=$(echo "$line" | cut -d' ' -f7 | tr -d '"\\' | tr -cd ' -~' | tr '_' ' ')
+		case $b in ''|-) b=null ;; *) b="\"$b\"" ;; esac
+		bs=$(echo "$line" | cut -d' ' -f8 | tr -d '"\\' | tr -cd ' -~' | awk -F+ '{ for (i = 1; i <= NF; i++) if ($i != "" && $i != "-") { printf "%s\"%s\"", c, $i; c = "," } }')
+		[ -n "$bs" ] && bs="[$bs]" || bs=null
+	fi
+	plan=$(active_plan)
+	printf '"online":%s,"rsrp":%s,"sinr":%s,"band":%s,"bands":%s,"plan":%s' "$on" "$v" "$s" "$b" "$bs" "$([ -n "$plan" ] && echo "{$plan}" || echo null)"
+}
+
+feed() {
+	local in since nonce proof key body
+	in=$(head -c 400 | tr -d '\n')
+	since=$(val since "$in" | tr -d ' }')
+	nonce=$(val nonce "$in")
+	proof=$(val proof "$in")
+	case $since in ''|*[!0-9]*) echo '{}'; return ;; esac
+	case $nonce in *[!0-9a-f]*) echo '{}'; return ;; esac
+	[ ${#since} -le 10 ] && [ ${#nonce} = 32 ] && [ -s "$KEY" ] || { echo '{}'; return; }
+	key=$(cat "$KEY")
+	[ "$proof" = "$(sha "$key:q:$nonce:$since:$key")" ] || { echo '{}'; return; }
+	body="{$(events_json "$since"),\"settings\":{$(settings_json)},$(state_json)}"
+	printf '{"body":"%s","sig":"%s"}\n' "$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$(sha "$key:a:$nonce:$body:$key")"
+}
+
+# block <type> <json>: the {...} object for one alert type
+block() { printf '%s' "$2" | tr -d '\n' | sed -n "s/.*\"$1\" *: *{\([^}]*\)}.*/\1/p"; }
+val() { printf '%s' "$2" | sed -n "s/.*\"$1\" *: *\"\{0,1\}\([^,\"]*\).*/\1/p"; }
+
+set_settings() {
+	local in t b m v cmds=
+	in=$(cat)
+	for t in internet signal device data restart; do
+		b=$(block "$t" "$in")
+		[ -n "$b" ] || continue
+		m=$(val mode "$b")
+		if [ -n "$m" ]; then
+			case $m in buzz|log|off) cmds="$cmds keystone-alerts.$t.mode=$m" ;; *) echo '{"error":"mode must be buzz, log or off"}'; return ;; esac
+		fi
+		v=$(val rsrp_below "$b")
+		if [ -n "$v" ]; then range "$v" -140 -60 || { echo '{"error":"rsrp_below must be -140 to -60"}'; return; }; cmds="$cmds keystone-alerts.$t.rsrp_below=$v"; fi
+		v=$(val warn_pct "$b")
+		if [ -n "$v" ]; then range "$v" 50 99 || { echo '{"error":"warn_pct must be 50-99"}'; return; }; cmds="$cmds keystone-alerts.$t.warn_pct=$v"; fi
+		v=$(val fairuse_pct "$b")
+		if [ -n "$v" ]; then range "$v" 50 99 || { echo '{"error":"fairuse_pct must be 50-99"}'; return; }; cmds="$cmds keystone-alerts.$t.fairuse_pct=$v"; fi
+	done
+	for v in $cmds; do
+		$UCI -q get "${v%%.*}.$(echo "$v" | cut -d. -f2)" >/dev/null 2>&1 || $UCI set "${v%%.*}.$(echo "$v" | cut -d. -f2)=alert"
+		$UCI set "$v" >/dev/null 2>&1 || { echo '{"error":"could not save"}'; return; }
+	done
+	$UCI commit keystone-alerts >/dev/null 2>&1
+	printf '{%s}\n' "$(settings_json)"
+}
+
+case "$1" in
+list)
+	echo '{ "info": {}, "events": { "since": 0 }, "set": { "internet": {}, "signal": {}, "device": {}, "data": {}, "restart": {} }, "clear": {}, "pair": {}, "reset_key": {}, "feed": { "since": 0, "nonce": "", "proof": "" } }'
+	;;
+call)
+	case "$2" in
+	info) info ;;
+	events) events ;;
+	set) set_settings ;;
+	pair) pair ;;
+	reset_key) new_key; echo '{}' ;;
+	feed) feed ;;
+	clear) : > "$T/events"; flush 1; echo '{}' ;;
+	esac
+	;;
+esac

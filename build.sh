@@ -18,6 +18,7 @@ for P in $dirs; do
 	rm -rf package/$P
 	mkdir -p package/$P
 	cp -r /src/$P/Makefile /src/$P/files package/$P/
+	cp /src/common/files/common.sh package/$P/files/
 	sed -i "/CONFIG_PACKAGE_$P[= ]/d" .config
 	echo "CONFIG_PACKAGE_$P=m" >> .config
 	make defconfig >/dev/null
@@ -27,27 +28,46 @@ for P in $dirs; do
 
 	IPK=/tmp/ipk; rm -rf $IPK; mkdir -p $IPK/c $IPK/d
 	F=/src/$P/files
-	install -d $IPK/d/usr/sbin $IPK/d/etc/init.d $IPK/d/etc/config $IPK/d/usr/libexec/rpcd $IPK/d/usr/share/rpcd/acl.d $IPK/d/usr/share/$P
-	install -m755 $F/$P $IPK/d/usr/sbin/$P
-	install -m755 $F/$P.init $IPK/d/etc/init.d/$P
-	install -m600 $F/$P.config $IPK/d/etc/config/$P
-	install -m755 $F/$P.rpcd $IPK/d/usr/libexec/rpcd/keystone.${P#keystone-}
-	install -m644 $F/$P.acl.json $IPK/d/usr/share/rpcd/acl.d/$P.json
+	install -d $IPK/d/usr/share/$P
+	if [ -f $F/$P ]; then install -d $IPK/d/usr/sbin; install -m755 $F/$P $IPK/d/usr/sbin/$P; fi
+	if [ -f $F/$P.init ]; then install -d $IPK/d/etc/init.d; install -m755 $F/$P.init $IPK/d/etc/init.d/$P; fi
+	if [ -f $F/$P.config ]; then install -d $IPK/d/etc/config; install -m600 $F/$P.config $IPK/d/etc/config/$P; fi
+	if [ -f $F/$P.rpcd ]; then install -d $IPK/d/usr/libexec/rpcd; install -m755 $F/$P.rpcd $IPK/d/usr/libexec/rpcd/keystone.${P#keystone-}; fi
+	if [ -f $F/$P.acl.json ]; then install -d $IPK/d/usr/share/rpcd/acl.d; install -m644 $F/$P.acl.json $IPK/d/usr/share/rpcd/acl.d/$P.json; fi
+	if [ -f $F/$P.fw ]; then install -m755 $F/$P.fw $IPK/d/usr/share/$P/$P.fw; fi
+	install -m644 /src/common/files/common.sh $IPK/d/usr/share/$P/common.sh
 	echo $V > $IPK/d/usr/share/$P/version
+	D=$(sed -n 's/^ *DEPENDS:=//p' /src/$P/Makefile | tr -d '+' | sed 's/^ *//; s/ *$//; s/  */, /g')
 	cat > $IPK/c/control <<EOC
 Package: $P
 Version: $V
-Depends: rpcd
+Depends: $D
 Section: utils
 Architecture: all
 Maintainer: perz3us
 License: GPL-3.0-or-later
 Description: $T
 EOC
-	echo /etc/config/$P > $IPK/c/conffiles
-	printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || {\n\t/etc/init.d/rpcd reload\n\t/etc/init.d/%s enable\n\t/etc/init.d/%s restart\n}\nexit 0\n' $P $P > $IPK/c/postinst
-	printf '#!/bin/sh\n[ -n "$IPKG_INSTROOT" ] || {\n\t/etc/init.d/%s stop\n\t/etc/init.d/%s disable\n}\nexit 0\n' $P $P > $IPK/c/prerm
-	chmod 755 $IPK/c/postinst $IPK/c/prerm
+	[ -n "$D" ] || sed -i '/^Depends: $/d' $IPK/c/control
+	if [ -f $F/$P.init ]; then
+		[ -f $F/$P.config ] && echo /etc/config/$P > $IPK/c/conffiles
+		printf '#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] || {
+	/etc/init.d/rpcd reload
+	/etc/init.d/%s enable
+	/etc/init.d/%s restart
+}
+exit 0
+' $P $P > $IPK/c/postinst
+		printf '#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] || {
+	/etc/init.d/%s stop
+	/etc/init.d/%s disable
+}
+exit 0
+' $P $P > $IPK/c/prerm
+		chmod 755 $IPK/c/postinst $IPK/c/prerm
+	fi
 	echo 2.0 > $IPK/debian-binary
 	tar --numeric-owner --owner=0 --group=0 -C $IPK/d -czf $IPK/data.tar.gz .
 	tar --numeric-owner --owner=0 --group=0 -C $IPK/c -czf $IPK/control.tar.gz .

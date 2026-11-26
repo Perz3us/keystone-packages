@@ -20,6 +20,16 @@ case "$1 $2 $3" in
 "call network.interface dump") cat "$FAKE_DUMP" ;;
 esac
 X
+cat > "$W/bin/mmcli" <<'X'
+#!/bin/sh
+echo "mmcli $*" >> "$FAKE_LOG"
+[ -n "$FAKE_MM" ] || { echo "error: couldn't find the ModemManager process in the bus" >&2; exit 1; }
+case "$*" in
+*--signal-setup*) exit 0 ;;
+*--signal-get*) cat "$FAKE_MM" ;;
+esac
+X
+chmod +x "$W/bin/mmcli"
 cat > "$W/bin/ping" <<'X'
 #!/bin/sh
 echo "ping $*" >> "$FAKE_LOG"
@@ -32,9 +42,13 @@ case "$*" in
 *"show qmodem"*) echo "qmodem.m1=modem-device" ;;
 *keystone-history.main.ping_target*) [ -n "$FAKE_TARGET" ] && echo "$FAKE_TARGET" || exit 1 ;;
 *keystone-history.main.tcp_target*) [ -n "$FAKE_TCP" ] && echo "$FAKE_TCP" || exit 1 ;;
-*"set keystone-history.main.keep_days="*) echo "${*##*=}" > "$FAKE_KEEP" ;;
+*"set keystone-history.main.keep_days="*) echo "${2#*=}" > "$FAKE_KEEP" ;;
 *keystone-history.main.keep_days*) [ -f "$FAKE_KEEP" ] && cat "$FAKE_KEEP" || exit 1 ;;
 *commit*) echo "uci $*" >> "$FAKE_LOG" ;;
+*"set keystone-history."*) k=${2%%=*}; grep -v "^$k=" "$FAKE_UCIDB" > "$FAKE_UCIDB.n" 2>/dev/null; echo "$2" >> "$FAKE_UCIDB.n"; mv "$FAKE_UCIDB.n" "$FAKE_UCIDB" ;;
+*"delete keystone-history."*) eval k=\${$#}; grep -v "^$k[.=]" "$FAKE_UCIDB" > "$FAKE_UCIDB.n" 2>/dev/null; mv "$FAKE_UCIDB.n" "$FAKE_UCIDB" ;;
+*"get keystone-history."*) eval k=\${$#}; v=$(sed -n "s/^$k=//p" "$FAKE_UCIDB" 2>/dev/null); [ -n "$v" ] && echo "$v" || exit 1 ;;
+*"show keystone-history"*) cat "$FAKE_UCIDB" 2>/dev/null ;;
 esac
 X
 cat > "$W/bin/date" <<'X'
@@ -42,6 +56,7 @@ cat > "$W/bin/date" <<'X'
 case "$1" in
 +%s) echo "$FAKE_NOW" ;;
 +%Y-%m) echo "${FAKE_MONTH:-2026-11}" ;;
++%F) echo "${FAKE_DAY:-2026-11-20}" ;;
 esac
 X
 printf '#!/bin/sh
@@ -123,11 +138,12 @@ setup() {
 	echo 1000 > "$W/sys/wwan0_1/statistics/rx_bytes"
 	echo 500 > "$W/sys/wwan0_1/statistics/tx_bytes"
 	export KS_TMP="$W/tmp" KS_ETC="$W/etc" KS_SYS="$W/sys" KS_5G="$W/g5"
-	export UBUS="$W/bin/ubus" PING="$W/bin/ping" CURL="$W/bin/curl" UCI="$W/bin/uci" DATE="$W/bin/date"
+	export MMCLI="$W/bin/mmcli" UBUS="$W/bin/ubus" PING="$W/bin/ping" CURL="$W/bin/curl" UCI="$W/bin/uci" DATE="$W/bin/date"
 	export FAKE_KEEP="$W/keep" KS_COLLECTOR="$W/bin/collector"
 export FAKE_LOG="$W/log" FAKE_CELL="$W/cell.json" FAKE_BAND="$W/band.json" FAKE_DUMP="$W/dump.json"
-	export FAKE_NOW=1000000 FAKE_QMODEM=1
-	unset FAKE_PING_FAIL FAKE_TARGET FAKE_CURL FAKE_TCP FAKE_CURL_RC
+	export FAKE_NOW=1000000 FAKE_QMODEM=1 FAKE_UCIDB="$W/ucidb" KS_SIM_CACHE="$W/sim" KS_SIM_CHECKED="$W/sim.checked" KS_COMMON="$HERE/../common/files/common.sh"
+	: > "$W/ucidb"; unset FAKE_DAY
+	unset FAKE_MM FAKE_PING_FAIL FAKE_TARGET FAKE_CURL FAKE_TCP FAKE_CURL_RC
 	export KS_VERSION_FILE="$W/version" KS_MIN_TIME=0
 	echo 0.1.0 > "$W/version"
 }
@@ -138,18 +154,18 @@ valid() { printf '%s' "$1" | tr -d '\n\t' | grep -Eq '^\{("[a-z]+":(\[[^]]*\]|"[
 
 setup
 collect
-eq "qmodem line" "$(cat "$W/tmp/points")" "1000000 -95 17 23.4 151 1725 B3"
+eq "qmodem line" "$(cat "$W/tmp/points")" "1000000 -95 17 23.4 151 1725 B3 B3"
 
 setup; FAKE_QMODEM=
 collect
-eq "no qmodem gives dashes" "$(cat "$W/tmp/points")" "1000000 - - 23.4 - - -"
+eq "no qmodem gives dashes" "$(cat "$W/tmp/points")" "1000000 - - 23.4 - - - -"
 
 setup; FAKE_QMODEM=
 cat > "$W/g5/metrics_m_4_1.json" <<'X'
 {"rsrp":"-101","rsrq":"-11","sinr":"4","pci":"220","earfcn":"1300","pband":"B3","signal":"60"}
 X
 collect
-eq "5gmodem metrics" "$(cat "$W/tmp/points")" "1000000 -101 4 23.4 220 1300 B3"
+eq "5gmodem metrics" "$(cat "$W/tmp/points")" "1000000 -101 4 23.4 220 1300 B3 B3"
 
 setup; export FAKE_PING_FAIL=1
 collect
@@ -211,10 +227,10 @@ eq "empty history" "$OUT" '{"points":[],"traffic":[]}'
 
 setup
 OUT=$(rpc call info)
-eq "info" "$OUT" '{"version":"0.1.0","sources":["qmodem","ping","traffic"],"keep_days":7,"max_days":30,"ping_method":"none"}'
+eq "info" "$OUT" '{"version":"0.1.0","sources":["qmodem","ping","traffic"],"keep_days":7,"max_days":30,"ping_method":"none","active_sim":"main","plans":[]}'
 FAKE_QMODEM=
 OUT=$(rpc call info)
-eq "info without qmodem" "$OUT" '{"version":"0.1.0","sources":["ping","traffic"],"keep_days":7,"max_days":30,"ping_method":"none"}'
+eq "info without qmodem" "$OUT" '{"version":"0.1.0","sources":["ping","traffic"],"keep_days":7,"max_days":30,"ping_method":"none","active_sim":"main","plans":[]}'
 
 setup
 case "$(rpc list)" in *'"info"'*'"history"'*'"set"'*) ok "list" ;; *) bad "list" ;; esac
@@ -395,7 +411,7 @@ eq "set stored in uci" "$(cat "$W/keep")" "3"
 grep -q '^uci commit keystone-history$' "$W/log" && ok "set commits uci" || bad "set commits uci"
 eq "set prunes ram copy at once" "$(wc -l < "$W/tmp/points" | tr -d ' ')" "1"
 eq "set prunes flash copy at once" "$(wc -l < "$W/etc/points" | tr -d ' ')" "1"
-eq "info shows new keep_days" "$(rpc call info)" '{"version":"0.1.0","sources":["qmodem","ping","traffic"],"keep_days":3,"max_days":30,"ping_method":"none"}'
+eq "info shows new keep_days" "$(rpc call info)" '{"version":"0.1.0","sources":["qmodem","ping","traffic"],"keep_days":3,"max_days":30,"ping_method":"none","active_sim":"main","plans":[]}'
 
 setup; echo 30 > "$W/keep"
 case "$(rpc call info)" in *'"keep_days":30,"max_days":30,'*) ok "info shows 30" ;; *) bad "info shows 30" ;; esac
@@ -479,6 +495,119 @@ grep -q "$C" "$W/g5/metrics_m.json" && ok "fixture has control chars" || bad "fi
 collect
 eq "control chars stripped, digits kept" "$(cut -d' ' -f7 "$W/tmp/points")" "B3_(1800_MHz)_@20_MHz"
 
+setup
+collect
+echo 3000 > "$W/sys/wwan0_1/statistics/rx_bytes"
+echo 800 > "$W/sys/wwan0_1/statistics/tx_bytes"
+FAKE_NOW=1000120 collect
+eq "daily first write" "$(cat "$W/tmp/daily.main")" "2026-11-20 2000 300"
+echo 3500 > "$W/sys/wwan0_1/statistics/rx_bytes"
+FAKE_DAY=2026-11-21 FAKE_NOW=1000240 collect
+eq "daily rolls day" "$(tail -n 1 "$W/tmp/daily.main")" "2026-11-21 500 0"
+eq "monthly still written" "$(cat "$W/tmp/traffic.2026-11")" "2500 300"
+
+setup
+i=1; while [ $i -le 105 ]; do printf '2026-%02d-%02d 1 1\n' $(( (i - 1) / 28 + 1 )) $(( (i - 1) % 28 + 1 )); i=$((i + 1)); done > "$W/tmp/daily.main"
+collect
+eq "daily cap 100" "$(wc -l < "$W/tmp/daily.main" | tr -d ' ')" 100
+
+setup
+printf '2026-11-14 100 1\n2026-11-15 10 1\n2026-11-20 20 2\n' > "$W/tmp/daily.main"
+OUT=$(echo '{"sim":"main","plan":"capped","allowance_gb":50,"billing_day":15}' | rpc call set_plan)
+eq "set_plan saves" "$OUT" '{"sim":"main","plan":"capped","allowance_gb":50,"billing_day":15,"period_start":"2026-11-15","period_end":"2026-12-14","down":30,"up":3}'
+OUT=$(rpc call info)
+case $OUT in *'"plans":[{"sim":"main","plan":"capped","allowance_gb":50,"billing_day":15,"period_start":"2026-11-15","period_end":"2026-12-14","down":30,"up":3}]}') ok "plan period sum" ;; *) bad "plan period sum ($OUT)" ;; esac
+OUT=$(echo '{"sim":"main","plan":"none"}' | rpc call set_plan)
+OUT=$(rpc call info)
+case $OUT in *'"plans":[{"sim":"main","plan":"","allowance_gb":0,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":130,"up":4}]}') ok "plan none uses calendar month" ;; *) bad "plan none uses calendar month ($OUT)" ;; esac
+
+setup
+OUT=$(echo '{"sim":"main","plan":"unlimited","billing_day":32}' | rpc call set_plan)
+case $OUT in *error*) ok "set_plan bad day" ;; *) bad "set_plan bad day ($OUT)" ;; esac
+OUT=$(echo '{"sim":"main","plan":"capped","billing_day":3}' | rpc call set_plan)
+case $OUT in *error*) ok "set_plan capped no allowance" ;; *) bad "set_plan capped no allowance ($OUT)" ;; esac
+OUT=$(echo '{"sim":"a;b","plan":"unlimited","billing_day":3}' | rpc call set_plan)
+case $OUT in *error*) ok "set_plan bad sim" ;; *) bad "set_plan bad sim ($OUT)" ;; esac
+OUT=$(echo '{"sim":"main","plan":"loud","billing_day":3}' | rpc call set_plan)
+case $OUT in *error*) ok "set_plan bad plan" ;; *) bad "set_plan bad plan ($OUT)" ;; esac
+OUT=$(echo '{"sim":"main","plan":"unlimited","billing_day":3}' | rpc call set_plan)
+case $OUT in *'"plan":"unlimited"'*) ok "set_plan unlimited no allowance" ;; *) bad "set_plan unlimited no allowance ($OUT)" ;; esac
+
+setup
+echo "5000 700" > "$W/tmp/traffic.2026-11"
+collect
+eq "upgrade seeds the month so far" "$(head -n 1 "$W/tmp/daily.main")" "2026-11-01 5000 700"
+echo 9000 > "$W/sys/wwan0_1/statistics/rx_bytes"
+FAKE_NOW=1000120 collect
+case $(cat "$W/tmp/daily.main") in *"2026-11-20 "*) ok "then counts per day" ;; *) bad "then counts per day" ;; esac
+eq "seeds only once" "$(grep -c 2026-11-01 "$W/tmp/daily.main")" 1
+setup
+collect
+eq "fresh install seeds nothing" "$(grep -c 2026-11-01 "$W/tmp/daily.main")" 0
+
+setup
+printf 'keystone-history.main=main
+keystone-history.main.keep_days=14
+' > "$W/ucidb"
+echo '{"sim":"main","plan":"capped","allowance_gb":5,"billing_day":3}' | rpc call set_plan > /dev/null
+echo '{"sim":"main","plan":"none"}' | rpc call set_plan > /dev/null
+eq "a plan for the SIM called main leaves the settings alone" "$(sed -n 's/^keystone-history.main=//p' "$W/ucidb")" main
+eq "keep_days survives removing that plan" "$(sed -n 's/^keystone-history.main.keep_days=//p' "$W/ucidb")" 14
+
+# Bands in use, primary first (column 8)
+setup; FAKE_QMODEM=
+printf '%s\n' '{"rsrp":"-93","sinr":"15","pci":"151","earfcn":"1725","pband":"B3 (1800 MHz) @20 MHz","s1band":"B1 (2100 MHz) @15 MHz","s2band":"B1 (2100 MHz) @10 MHz","s3band":"-","s4band":"-"}' > "$W/g5/metrics_m.json"
+collect
+eq "5gmodem bands with CA" "$(cut -d' ' -f7,8 "$W/tmp/points")" "B3_(1800_MHz)_@20_MHz B3+B1+B1"
+setup; FAKE_QMODEM=
+printf '{"rsrp":"-90","pband":"B3\\x\001","s1band":"n78\\ (3500 MHz)"}\n' > "$W/g5/metrics_m.json"
+collect
+eq "dirty band names are cleaned" "$(cut -d' ' -f8 "$W/tmp/points")" "B3x+n78"
+setup
+cat > "$W/band2.json" <<'X'
+{
+	"current_band": {
+		"status": "ok",
+		"cells": [
+			{ "role": "pcc", "rat": "LTE", "band_name": "B3", "channel": "1725", "pci": "151" },
+			{ "role": "nsa", "rat": "NR", "band_name": "N78", "channel": "636666", "pci": "22" }
+		]
+	}
+}
+X
+FAKE_BAND="$W/band2.json" collect
+eq "qmodem bands with NSA" "$(cut -d' ' -f7,8 "$W/tmp/points")" "B3 B3+N78"
+setup; FAKE_QMODEM=
+cat > "$W/mm.txt" <<'X'
+modem.signal.refresh.rate                 : 60
+modem.signal.lte.rssi                     : -65.00
+modem.signal.lte.rsrq                     : -11.00
+modem.signal.lte.rsrp                     : -97.00
+modem.signal.lte.snr                      : 12.00
+modem.signal.5g.rsrp                      : --
+modem.signal.5g.snr                       : --
+X
+export FAKE_MM="$W/mm.txt"
+collect
+eq "modemmanager lte" "$(cut -d' ' -f2,3,5,6,7,8 "$W/tmp/points")" "-97.00 12.00 - - - -"
+grep -q signal-setup "$W/log" && bad "polling already on is left alone" || ok "polling already on is left alone"
+setup; FAKE_QMODEM=
+sed 's/^modem.signal.5g.rsrp .*/modem.signal.5g.rsrp : -88.00/; s/^modem.signal.5g.snr .*/modem.signal.5g.snr : 20.50/' "$W/mm.txt" > "$W/mm5.txt"
+export FAKE_MM="$W/mm5.txt"
+collect
+eq "modemmanager 5g wins" "$(cut -d' ' -f2,3 "$W/tmp/points")" "-88.00 20.50"
+setup; FAKE_QMODEM=
+sed 's/^modem.signal.refresh.rate .*/modem.signal.refresh.rate : 0/; s/^modem.signal.lte.rsrp .*/modem.signal.lte.rsrp : --/; s/^modem.signal.lte.snr .*/modem.signal.lte.snr : --/' "$W/mm.txt" > "$W/mm0.txt"
+export FAKE_MM="$W/mm0.txt"
+collect
+eq "modemmanager polling off turns it on" "$(grep -c -- '--signal-setup=60' "$W/log")" 1
+eq "first reading after turning it on" "$(cut -d' ' -f2,3 "$W/tmp/points")" "- -"
+setup; FAKE_QMODEM=
+collect
+eq "no modem at all" "$(cut -d' ' -f8 "$W/tmp/points")" "-"
+setup
+echo "100 -90 10 20 1 2 B3 B3+B1" > "$W/tmp/points"; echo "200 -91 11 21 1 2 B3" >> "$W/tmp/points"
+eq "history stays 7 values" "$(echo '{"from":0,"to":300}' | rpc call history)" '{"points":[[100,-90,10,20,1,2,"B3"],[200,-91,11,21,1,2,"B3"]],"traffic":[]}'
 
 for f in keystone-history keystone-history.rpcd keystone-history.init; do
 	sh -n "$HERE/files/$f" && ok "syntax $f" || bad "syntax $f"

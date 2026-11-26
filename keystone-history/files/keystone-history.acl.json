@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"keystone.history": [ "set" ]
+				"keystone.history": [ "set", "set_plan" ]
 			}
 		}
 	}

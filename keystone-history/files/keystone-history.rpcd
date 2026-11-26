@@ -6,6 +6,8 @@ UBUS=${UBUS:-ubus}
 UCI=${UCI:-uci}
 COLLECTOR=${KS_COLLECTOR:-/usr/sbin/keystone-history}
 VERSION=${KS_VERSION_FILE:-/usr/share/keystone-history/version}
+DATE=${DATE:-date}
+. "${KS_COMMON:-/usr/share/keystone-history/common.sh}" || exit 1
 
 valid_days() {
 	case $1 in ''|0*|???*|*[!0-9]*) return 1 ;; esac
@@ -20,7 +22,62 @@ info() {
 	[ -n "$(find "$G5" -name 'metrics_*.json' -mmin -5 2>/dev/null | head -n 1)" ] && s="$s\"5gmodem\","
 	pm=$(cat "$T/method" 2>/dev/null)
 	case $pm in icmp|tcp) ;; *) pm=none ;; esac
-	printf '{"version":"%s","sources":[%s"ping","traffic"],"keep_days":%s,"max_days":30,"ping_method":"%s"}\n' "$(cat "$VERSION" 2>/dev/null)" "$s" "$k" "$pm"
+	printf '{"version":"%s","sources":[%s"ping","traffic"],"keep_days":%s,"max_days":30,"ping_method":"%s","active_sim":"%s","plans":[%s]}\n' "$(cat "$VERSION" 2>/dev/null)" "$s" "$k" "$pm" "$(ks_sim_key)" "$(plans)"
+}
+
+plan_json() {
+	local k=$1 p a b today ps pe
+	p=$($UCI -q get keystone-history.sim_$k.plan)
+	a=$($UCI -q get keystone-history.sim_$k.allowance_gb)
+	b=$($UCI -q get keystone-history.sim_$k.billing_day)
+	case $a in ''|*[!0-9]*) a=0 ;; esac
+	case $b in ''|*[!0-9]*) b=1 ;; esac
+	today=$($DATE +%F)
+	ps=$(ks_period_start "$today" "$b")
+	pe=$(ks_period_end "$today" "$b")
+	set -- $(awk -v s="$ps" -v e="$pe" '$1 >= s && $1 <= e { d += $2; u += $3 } END { printf "%.0f %.0f\n", d, u }' "$T/daily.$k" 2>/dev/null)
+	printf '{"sim":"%s","plan":"%s","allowance_gb":%s,"billing_day":%s,"period_start":"%s","period_end":"%s","down":%s,"up":%s}' "$k" "$p" "$a" "$b" "$ps" "$pe" "${1:-0}" "${2:-0}"
+}
+
+plans() {
+	local k f sep=
+	for k in $( { for f in "$T"/daily.*; do [ -f "$f" ] && echo "${f##*/daily.}"; done
+		$UCI -q show keystone-history | sed -n 's/^keystone-history\.\([0-9A-Za-z]*\)=sim$/\1/p'; } | sort -u); do
+		printf '%s%s' "$sep" "$(plan_json "$k")"
+		sep=,
+	done
+}
+
+field() { sed -n "s/.*\"$1\" *: *\"\{0,1\}\([^,}\"]*\).*/\1/p" | head -n 1; }
+
+set_plan() {
+	local in sim p a b
+	in=$(cat)
+	sim=$(printf '%s' "$in" | field sim)
+	p=$(printf '%s' "$in" | field plan)
+	a=$(printf '%s' "$in" | field allowance_gb)
+	b=$(printf '%s' "$in" | field billing_day)
+	case $sim in ''|*[!0-9A-Za-z]*) echo '{"error":"sim must be letters and digits"}'; return ;; esac
+	[ ${#sim} -le 32 ] || { echo '{"error":"sim too long"}'; return; }
+	if [ "$p" = none ]; then
+		{ $UCI -q delete keystone-history.sim_$sim; $UCI commit keystone-history; } >/dev/null 2>&1
+		plan_json "$sim"; echo; return
+	fi
+	case $p in unlimited|capped|fairuse) ;; *) echo '{"error":"plan must be unlimited, capped, fairuse or none"}'; return ;; esac
+	case $b in ''|0*|*[!0-9]*) echo '{"error":"billing_day must be 1-31"}'; return ;; esac
+	[ "$b" -le 31 ] || { echo '{"error":"billing_day must be 1-31"}'; return; }
+	if [ "$p" != unlimited ]; then
+		case $a in ''|0*|*[!0-9]*) echo '{"error":"allowance_gb must be 1-100000"}'; return ;; esac
+		{ [ ${#a} -le 6 ] && [ "$a" -le 100000 ]; } || { echo '{"error":"allowance_gb must be 1-100000"}'; return; }
+	fi
+	{
+		$UCI set keystone-history.sim_$sim=sim &&
+		$UCI set keystone-history.sim_$sim.plan="$p" &&
+		$UCI set keystone-history.sim_$sim.billing_day="$b" &&
+		if [ "$p" = unlimited ]; then $UCI -q delete keystone-history.sim_$sim.allowance_gb; true; else $UCI set keystone-history.sim_$sim.allowance_gb="$a"; fi &&
+		$UCI commit keystone-history
+	} >/dev/null 2>&1 || { echo '{"error":"could not save the plan"}'; return; }
+	plan_json "$sim"; echo
 }
 
 set_days() {
@@ -61,13 +118,14 @@ history() {
 
 case "$1" in
 list)
-	echo '{ "info": {}, "history": { "from": 0, "to": 0 }, "set": { "keep_days": 0 } }'
+	echo '{ "info": {}, "history": { "from": 0, "to": 0 }, "set": { "keep_days": 0 }, "set_plan": { "sim": "", "plan": "", "allowance_gb": 0, "billing_day": 0 } }'
 	;;
 call)
 	case "$2" in
 	info) info ;;
 	history) history ;;
 	set) set_days ;;
+	set_plan) set_plan ;;
 	esac
 	;;
 esac

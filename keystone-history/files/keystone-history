@@ -6,11 +6,13 @@ E=${KS_ETC:-/etc/keystone-history}
 SYS=${KS_SYS:-/sys/class/net}
 G5=${KS_5G:-/tmp/5gmodem}
 UBUS=${UBUS:-ubus}
+MMCLI=${MMCLI:-mmcli}
 PING=${PING:-ping}
 CURL=${CURL:-curl}
 UCI=${UCI:-uci}
 DATE=${DATE:-date}
 MINTIME=${KS_MIN_TIME:-1704067200}
+. "${KS_COMMON:-/usr/share/keystone-history/common.sh}" || exit 1
 
 now=$($DATE +%s)
 [ "$now" -ge "$MINTIME" ] 2>/dev/null || exit 0
@@ -38,25 +40,6 @@ if [ "$mode" = prune ]; then
 	exit 0
 fi
 
-wan_dev() {
-	$UBUS call network.interface dump 2>/dev/null | awk '
-		function out() { if (dev != "") print dev, proto, up, def }
-		/^[ \t]*"interface":/ { out(); up = 0; dev = ""; proto = "-"; def = 0; tgt = 0 }
-		/"up": true/ { up = 1 }
-		/"l3_device":/ { split($0, a, "\""); dev = a[4] }
-		/"proto":/ { split($0, a, "\""); proto = a[4] }
-		/"target": "0.0.0.0"/ { tgt = 1 }
-		/"mask": 0,?$/ { if (tgt) def = 1 }
-		END { out() }
-	' | awk '
-		$3 != 1 { next }
-		$2 ~ /^(wireguard|openvpn|vpnc|l2tp|pptp)$/ || $1 ~ /^(tun|wg|tailscale)/ { next }
-		$2 ~ /^(qmi|mbim|ncm|modemmanager|3g|wwan|quectel)$/ || $1 ~ /^(wwan|rmnet|qmimux|mhi_net|usb[0-9])/ { if (m == "") m = $1; next }
-		$4 == 1 { if (d == "") d = $1 }
-		END { print (m != "" ? m : d) }
-	'
-}
-
 num() { sed -n "s/.*\"$1\" *: *\"\{0,1\}\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | head -n 1; }
 str() { sed -n "s/.*\"$1\" *: *\"\([^\"]*\)\".*/\1/p" | head -n 1; }
 
@@ -67,14 +50,20 @@ kv() {
 	'
 }
 
-dev=$(wan_dev)
+# Short band names joined with +, primary first. Repeats stay: each one is a carrier.
+join_bands() {
+	sed 's/["\]//g; s/[^ -~]//g; s/^ *//; s/ .*//' | awk '$0 != "" && $0 != "-" { printf "%s%s", s, $0; s = "+" }'
+}
+
+dev=$(ks_wan_dev)
 [ -n "$dev" ] || dev=wwan0
 
-rsrp=- sinr=- pci=- earfcn=- band=-
+rsrp=- sinr=- pci=- earfcn=- band=- bands=-
 f=$(find "$G5" -name 'metrics_*.json' -mmin -5 2>/dev/null | head -n 1)
 if [ -n "$f" ]; then
 	rsrp=$(num rsrp < "$f"); sinr=$(num sinr < "$f"); pci=$(num pci < "$f"); earfcn=$(num earfcn < "$f")
 	band=$(str pband < "$f")
+	bands=$(for k in pband s1band s2band s3band s4band; do str $k < "$f"; done | join_bands)
 elif $UBUS list qmodem >/dev/null 2>&1; then
 	sec=$($UCI -q show qmodem | sed -n 's/^qmodem\.\([^.=]*\)=modem-device$/\1/p' | head -n 1)
 	arg="{\"config_section\":\"$sec\"}"
@@ -85,8 +74,16 @@ elif $UBUS list qmodem >/dev/null 2>&1; then
 	pci=$(printf '%s\n' "$cb" | num pci)
 	earfcn=$(printf '%s\n' "$cb" | num channel)
 	band=$(printf '%s\n' "$cb" | str band_name)
+	bands=$(printf '%s\n' "$cb" | sed -n 's/.*"band_name" *: *"\([^"]*\)".*/\1/p' | join_bands)
+elif mm=$($MMCLI -m any --signal-get -K 2>/dev/null) && [ -n "$mm" ]; then
+	# ModemManager reports signal but not which bands are serving.
+	mmv() { printf '%s\n' "$mm" | sed -n "s/^modem\.signal\.$1 *: *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | head -n 1; }
+	rsrp=$(mmv 5g.rsrp); [ -n "$rsrp" ] || rsrp=$(mmv lte.rsrp)
+	sinr=$(mmv 5g.snr); [ -n "$sinr" ] || sinr=$(mmv lte.snr)
+	# Polling is off by default, and then every reading is empty.
+	[ "$(printf '%s\n' "$mm" | sed -n 's/^modem\.signal\.refresh\.rate *: *\([0-9]*\).*/\1/p')" = 0 ] && $MMCLI -m any --signal-setup=60 >/dev/null 2>&1
 fi
-for v in rsrp sinr pci earfcn band; do
+for v in rsrp sinr pci earfcn band bands; do
 	eval "x=\$$v"
 	[ -n "$x" ] || eval "$v=-"
 done
@@ -109,22 +106,36 @@ fi
 [ -n "$ms" ] || ms=-
 echo "$method" > "$T/method"
 
-[ "$(tail -n 1 "$T/points" 2>/dev/null | cut -d" " -f1)" = "$now" ] || echo "$now $rsrp $sinr $ms $pci $earfcn $band" >> "$T/points"
+[ "$(tail -n 1 "$T/points" 2>/dev/null | cut -d" " -f1)" = "$now" ] || echo "$now $rsrp $sinr $ms $pci $earfcn $band $bands" >> "$T/points"
 prune "$T/points"
 
 rx=$(cat "$SYS/$dev/statistics/rx_bytes" 2>/dev/null)
 tx=$(cat "$SYS/$dev/statistics/tx_bytes" 2>/dev/null)
 if [ -n "$rx" ] && [ -n "$tx" ]; then
-	dd=0 du=0
-	[ -f "$T/traffic.$month" ] && read -r dd du < "$T/traffic.$month"
+	xd=0 xu=0
 	if [ -f "$T/last" ]; then
 		read -r ldev lrx ltx < "$T/last"
 		if [ "$ldev" = "$dev" ]; then
-			if [ "$rx" -ge "$lrx" ]; then dd=$((dd + rx - lrx)); else dd=$((dd + rx)); fi
-			if [ "$tx" -ge "$ltx" ]; then du=$((du + tx - ltx)); else du=$((du + tx)); fi
+			if [ "$rx" -ge "$lrx" ]; then xd=$((rx - lrx)); else xd=$rx; fi
+			if [ "$tx" -ge "$ltx" ]; then xu=$((tx - ltx)); else xu=$tx; fi
 		fi
 	fi
-	echo "${dd:-0} ${du:-0}" > "$T/traffic.$month"
+	dd=0 du=0
+	[ -f "$T/traffic.$month" ] && read -r dd du < "$T/traffic.$month"
+	daily="$T/daily.$(ks_sim_key)"
+	# Upgrading from a version without daily totals: count the month so far as its first
+	# day, so this month's usage isn't near zero.
+	if ! ls "$T"/daily.* >/dev/null 2>&1 && [ "$((${dd:-0} + ${du:-0}))" -gt 0 ]; then
+		echo "$month-01 ${dd:-0} ${du:-0}" > "$daily"
+	fi
+	[ -f "$daily" ] || : > "$daily"
+	awk -v d="$($DATE +%F)" -v xd=$xd -v xu=$xu '
+		$1 == d { $2 += xd; $3 += xu; seen = 1 }
+		{ print $1, $2, $3 }
+		END { if (!seen) print d, xd, xu }
+	' "$daily" 2>/dev/null > "$daily.new"
+	tail -n 100 "$daily.new" > "$daily" && rm -f "$daily.new"
+	echo "$((${dd:-0} + xd)) $((${du:-0} + xu))" > "$T/traffic.$month"
 	echo "$dev $rx $tx" > "$T/last"
 fi
 
@@ -135,7 +146,7 @@ if [ "$mode" = flush ] || [ "$since" -lt 0 ] || [ "$since" -ge 3600 ]; then
 	mkdir -p "$E"
 	cp "$T/points" "$E/points.new"
 	mv "$E/points.new" "$E/points"
-	for t in "$T"/traffic.*; do
+	for t in "$T"/traffic.* "$T"/daily.*; do
 		[ -f "$t" ] && cp "$t" "$E/"
 	done
 	echo "$now" > "$T/flushed"

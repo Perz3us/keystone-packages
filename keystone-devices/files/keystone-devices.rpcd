@@ -1,0 +1,53 @@
+#!/bin/sh
+
+DAEMON=${KS_DAEMON:-/usr/sbin/keystone-devices}
+VERSION=${KS_VERSION_FILE:-/usr/share/keystone-devices/version}
+[ -f "$DAEMON" ] || DAEMON=$(dirname "$0")/keystone-devices
+[ -f "$DAEMON" ] || exit 1
+KS_DEVICES_LIB=1
+. "$DAEMON"
+
+# Flow offloading lets traffic skip the counters, so totals read low.
+offload() {
+	[ -n "${KS_OFFLOAD-}" ] && { [ "$KS_OFFLOAD" = 1 ] && echo true || echo false; return; }
+	if [ "$($UCI -q get firewall.@defaults[0].flow_offloading)" = 1 ] || [ -d /sys/module/ecm ]; then
+		echo true
+	else
+		echo false
+	fi
+}
+
+periods() {
+	ls "$T"/period.* 2>/dev/null | sort -r | sed 's#.*/period\.##; s/.*/"&"/' | tr '\n' ',' | sed 's/,$//'
+}
+
+info() {
+	printf '{"version":"%s","backend":"%s","offload":%s,"periods":[%s]}\n' "$(cat "$VERSION" 2>/dev/null)" "$(cat "$T/backend" 2>/dev/null || echo none)" "$(offload)" "$(periods)"
+}
+
+usage() {
+	local p end bd
+	p=$(sed -n 's/.*"period" *: *"\([^"]*\)".*/\1/p' | head -n 1)
+	[ -n "$p" ] || p=$(period_start)
+	case $p in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) echo '{"error":"period must be YYYY-MM-DD"}'; return ;; esac
+	end=
+	if [ -f "$T/period.$p" ]; then
+		bd=$($UCI -q get keystone-history.sim_$(ks_sim_key).billing_day)
+		end=$(ks_period_end "$p" "${bd:-1}")
+	fi
+	printf '{"period_start":"%s","period_end":"%s","devices":[' "$p" "$end"
+	sort "$T/period.$p" 2>/dev/null | awk '{ printf "%s{\"mac\":\"%s\",\"down\":%s,\"up\":%s}", sep, $1, $2, $3; sep = "," }'
+	printf ']}\n'
+}
+
+case "$1" in
+list)
+	echo '{ "info": {}, "usage": { "period": "" } }'
+	;;
+call)
+	case "$2" in
+	info) info ;;
+	usage) usage ;;
+	esac
+	;;
+esac

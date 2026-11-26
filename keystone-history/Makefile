@@ -2,7 +2,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=keystone-history
-PKG_VERSION:=0.2.0
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_MAINTAINER:=perz3us
@@ -32,6 +32,7 @@ define Package/keystone-history/install
 	$(INSTALL_CONF) ./files/keystone-history.config $(1)/etc/config/keystone-history
 	$(INSTALL_BIN) ./files/keystone-history.rpcd $(1)/usr/libexec/rpcd/keystone.history
 	$(INSTALL_DATA) ./files/keystone-history.acl.json $(1)/usr/share/rpcd/acl.d/keystone-history.json
+	$(INSTALL_DATA) ./files/common.sh $(1)/usr/share/$(PKG_NAME)/common.sh
 	echo $(PKG_VERSION) > $(1)/usr/share/keystone-history/version
 endef
 
