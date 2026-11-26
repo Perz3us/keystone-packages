@@ -241,7 +241,7 @@ watch_signal() {
 	thr=$(nset signal rsrp_below -110 -140 -60)
 	line=$(tail -n 1 "$HIST/points" 2>/dev/null)
 	t=${line%% *}
-	v=$(echo "$line" | cut -d' ' -f2 | cut -d. -f1)
+	v=$(printf '%s\n' "$line" | cut -d' ' -f2 | cut -d. -f1)
 	case $t in ''|*[!0-9]*) t=0 ;; esac
 	if [ $((now - t)) -gt 300 ] || ! range "$v" -200 0; then
 		since=0

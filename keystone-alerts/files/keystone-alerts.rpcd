@@ -76,14 +76,14 @@ state_json() {
 	t=${line%% *}
 	case $t in ''|*[!0-9]*) t=0 ;; esac
 	if [ $(($(now_s) - t)) -le 300 ]; then
-		v=$(echo "$line" | cut -d' ' -f2 | cut -d. -f1)
+		v=$(printf '%s\n' "$line" | cut -d' ' -f2 | cut -d. -f1)
 		range "$v" -200 0 || v=null
-		s=$(echo "$line" | cut -d' ' -f3 | cut -d. -f1)
+		s=$(printf '%s\n' "$line" | cut -d' ' -f3 | cut -d. -f1)
 		range "$s" -50 60 || s=null
 		# Column 7 is the main band with _ for spaces; column 8, from newer history, is B3+B1+...
-		b=$(echo "$line" | cut -d' ' -f7 | tr -d '"\\' | tr -cd ' -~' | tr '_' ' ')
+		b=$(printf '%s\n' "$line" | cut -d' ' -f7 | tr -d '"\\' | tr -cd ' -~' | tr '_' ' ')
 		case $b in ''|-) b=null ;; *) b="\"$b\"" ;; esac
-		bs=$(echo "$line" | cut -d' ' -f8 | tr -d '"\\' | tr -cd ' -~' | awk -F+ '{ for (i = 1; i <= NF; i++) if ($i != "" && $i != "-") { printf "%s\"%s\"", c, $i; c = "," } }')
+		bs=$(printf '%s\n' "$line" | cut -d' ' -f8 | tr -d '"\\' | tr -cd ' -~' | awk -F+ '{ for (i = 1; i <= NF; i++) if ($i != "" && $i != "-") { printf "%s\"%s\"", c, $i; c = "," } }')
 		[ -n "$bs" ] && bs="[$bs]" || bs=null
 	fi
 	plan=$(active_plan)
