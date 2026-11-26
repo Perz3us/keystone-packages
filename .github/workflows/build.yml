@@ -1,8 +1,11 @@
 name: Build
 
+# One release per package: push a tag like keystone-alerts-v1.2.0 to build and release only
+# that package. A version with _alpha, _beta, _pre or _rc (keystone-alerts-v1.3.0_beta1) is
+# published as a pre-release. Running the workflow by hand builds every package, no release.
 on:
   push:
-    tags: ['v*']
+    tags: ['keystone-*-v*']
   workflow_dispatch:
 
 permissions:
@@ -19,13 +22,23 @@ jobs:
             file rsync gawk unzip bzip2 xz-utils zstd bison flex libncurses-dev wget git ca-certificates \
             swig gettext libelf-dev
       - uses: actions/checkout@v6
+      - run: for t in */tests/test.sh; do sh "$t" || exit 1; done
+      - name: Check the tag matches the package
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          P=${GITHUB_REF_NAME%-v*}
+          V=${GITHUB_REF_NAME##*-v}
+          [ -f "$P/Makefile" ] || { echo "no package called $P"; exit 1; }
+          M=$(sed -n 's/^PKG_VERSION:=//p' "$P/Makefile")
+          [ "$M" = "$V" ] || { echo "$P/Makefile says $M, the tag says $V"; exit 1; }
+          echo "PKG=$P" >> "$GITHUB_ENV"
       - run: |
           V=25.12.5
           N=openwrt-sdk-$V-qualcommax-ipq807x_gcc-14.3.0_musl.Linux-x86_64
           mkdir -p /cache
           wget -q -O- "https://downloads.openwrt.org/releases/$V/targets/qualcommax/ipq807x/$N.tar.zst" | tar -C /cache --zstd -x
           ln -s "$GITHUB_WORKSPACE" /src
-          sh build.sh
+          sh build.sh $PKG
       - uses: actions/upload-artifact@v7
         with:
           name: packages
@@ -40,15 +53,20 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
         with:
           name: packages
           path: dist
       - run: |
+          P=${GITHUB_REF_NAME%-v*}
+          V=${GITHUB_REF_NAME##*-v}
+          case "$V" in *_*) PRE=--prerelease ;; *) PRE= ;; esac
+          # The notes are this version's part of the package's changelog.
+          awk -v v="$V" '/^## / { on = ($2 == v); next } on' "$P/CHANGELOG.md" > notes.md
+          printf '\nInstall the .apk on NoobWRT and OpenWrt 25.12, or the .ipk on older firmware.\n' >> notes.md
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
-            case "$GITHUB_REF_NAME" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
-            gh release create "$GITHUB_REF_NAME" dist/* --title "${GITHUB_REF_NAME#v}" --repo "$GITHUB_REPOSITORY" $PRE \
-              --notes "Install the .apk on NoobWRT and OpenWrt 25.12, or the .ipk on older firmware."
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$P $V" --repo "$GITHUB_REPOSITORY" $PRE --notes-file notes.md
           fi
