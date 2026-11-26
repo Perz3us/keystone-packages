@@ -1,5 +1,10 @@
 # keystone-history changelog
 
+## 0.3.1
+
+- Data used this month now includes traffic from before the package was installed, taken from the firmware's own monthly counter (5G Modem app) or vnstat. Totals were far too low when it was installed mid-month.
+- Plans say which day counting began when it began inside the period, so the app can say "since" instead of "this month".
+
 ## 0.3.0
 
 - Records every band in use, primary first, so carrier aggregation shows up (B3+B1+B40).

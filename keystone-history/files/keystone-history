@@ -7,6 +7,8 @@ SYS=${KS_SYS:-/sys/class/net}
 G5=${KS_5G:-/tmp/5gmodem}
 UBUS=${UBUS:-ubus}
 MMCLI=${MMCLI:-mmcli}
+VNSTAT=${VNSTAT:-vnstat}
+FW_STATS=${KS_FW_STATS:-/etc/5gmodem/stats}
 PING=${PING:-ping}
 CURL=${CURL:-curl}
 UCI=${UCI:-uci}
@@ -50,9 +52,39 @@ kv() {
 	'
 }
 
-# Short band names joined with +, primary first. Repeats stay: each one is a carrier.
 join_bands() {
 	sed 's/["\]//g; s/[^ -~]//g; s/^ *//; s/ .*//' | awk '$0 != "" && $0 != "-" { printf "%s%s", s, $0; s = "+" }'
+}
+
+firmware_month() {
+	f="$FW_STATS/traffic.sim-$1.$month"
+	if [ -r "$f" ]; then
+		awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1, $2; exit }' "$f"
+		return
+	fi
+	[ "$(ls "$T"/daily.* 2>/dev/null | wc -l)" -le 1 ] || return 0
+	$VNSTAT --oneline b -i "$dev" 2>/dev/null |
+		awk -F';' -v m="$month" '$8 == m && $9 ~ /^[0-9]+$/ && $10 ~ /^[0-9]+$/ { print $9, $10 }'
+}
+
+fill_month() {
+	awk -v m="$month" -v fd="$2" -v fu="$3" '
+		{ r[NR] = $0; day[NR] = $1
+		  if (substr($1, 1, 7) == m) { sd += $2; su += $3; if (first == "" || $1 < first) first = $1 } }
+		END {
+			gd = fd - sd; gu = fu - su; if (gd < 0) gd = 0; if (gu < 0) gu = 0
+			n = substr(first, 9, 2) - 1
+			fill = first != "" && gd + gu >= 1048576
+			for (i = 1; i <= NR; i++) {
+				if (fill && n < 1 && day[i] == first) { split(r[i], f, " "); printf "%s %.0f %.0f\n", f[1], f[2] + gd, f[3] + gu }
+				else print r[i]
+			}
+			if (fill && n >= 1) for (d = 1; d <= n; d++) {
+				ed = int(gd / n); eu = int(gu / n)
+				if (d == 1) { ed += gd - ed * n; eu += gu - eu * n }
+				printf "%s-%02d %.0f %.0f\n", m, d, ed, eu
+			}
+		}' "$1" | sort
 }
 
 dev=$(ks_wan_dev)
@@ -76,11 +108,9 @@ elif $UBUS list qmodem >/dev/null 2>&1; then
 	band=$(printf '%s\n' "$cb" | str band_name)
 	bands=$(printf '%s\n' "$cb" | sed -n 's/.*"band_name" *: *"\([^"]*\)".*/\1/p' | join_bands)
 elif mm=$($MMCLI -m any --signal-get -K 2>/dev/null) && [ -n "$mm" ]; then
-	# ModemManager reports signal but not which bands are serving.
 	mmv() { printf '%s\n' "$mm" | sed -n "s/^modem\.signal\.$1 *: *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | head -n 1; }
 	rsrp=$(mmv 5g.rsrp); [ -n "$rsrp" ] || rsrp=$(mmv lte.rsrp)
 	sinr=$(mmv 5g.snr); [ -n "$sinr" ] || sinr=$(mmv lte.snr)
-	# Polling is off by default, and then every reading is empty.
 	[ "$(printf '%s\n' "$mm" | sed -n 's/^modem\.signal\.refresh\.rate *: *\([0-9]*\).*/\1/p')" = 0 ] && $MMCLI -m any --signal-setup=60 >/dev/null 2>&1
 fi
 for v in rsrp sinr pci earfcn band bands; do
@@ -123,19 +153,25 @@ if [ -n "$rx" ] && [ -n "$tx" ]; then
 	dd=0 du=0
 	[ -f "$T/traffic.$month" ] && read -r dd du < "$T/traffic.$month"
 	daily="$T/daily.$(ks_sim_key)"
-	# Upgrading from a version without daily totals: count the month so far as its first
-	# day, so this month's usage isn't near zero.
 	if ! ls "$T"/daily.* >/dev/null 2>&1 && [ "$((${dd:-0} + ${du:-0}))" -gt 0 ]; then
 		echo "$month-01 ${dd:-0} ${du:-0}" > "$daily"
 	fi
 	[ -f "$daily" ] || : > "$daily"
+	fw=$(firmware_month "$(ks_sim_key)")
 	awk -v d="$($DATE +%F)" -v xd=$xd -v xu=$xu '
 		$1 == d { $2 += xd; $3 += xu; seen = 1 }
 		{ print $1, $2, $3 }
 		END { if (!seen) print d, xd, xu }
 	' "$daily" 2>/dev/null > "$daily.new"
+	if [ -n "$fw" ]; then
+		fill_month "$daily.new" $fw > "$daily.fill" && mv "$daily.fill" "$daily.new"
+	fi
 	tail -n 100 "$daily.new" > "$daily" && rm -f "$daily.new"
 	echo "$((${dd:-0} + xd)) $((${du:-0} + xu))" > "$T/traffic.$month"
+	if [ -n "$fw" ]; then
+		echo "$fw" | awk -v t="$T/traffic.$month" '{ getline c < t; close(t); split(c, o, " ")
+			printf "%.0f %.0f\n", ($1 > o[1] ? $1 : o[1]), ($2 > o[2] ? $2 : o[2]) > t }'
+	fi
 	echo "$dev $rx $tx" > "$T/last"
 fi
 

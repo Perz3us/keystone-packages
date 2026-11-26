@@ -35,8 +35,9 @@ plan_json() {
 	today=$($DATE +%F)
 	ps=$(ks_period_start "$today" "$b")
 	pe=$(ks_period_end "$today" "$b")
-	set -- $(awk -v s="$ps" -v e="$pe" '$1 >= s && $1 <= e { d += $2; u += $3 } END { printf "%.0f %.0f\n", d, u }' "$T/daily.$k" 2>/dev/null)
-	printf '{"sim":"%s","plan":"%s","allowance_gb":%s,"billing_day":%s,"period_start":"%s","period_end":"%s","down":%s,"up":%s}' "$k" "$p" "$a" "$b" "$ps" "$pe" "${1:-0}" "${2:-0}"
+	set -- $(awk -v s="$ps" -v e="$pe" '{ if (m == "" || $1 < m) m = $1 } $1 >= s && $1 <= e { d += $2; u += $3 }
+		END { printf "%.0f %.0f %s\n", d, u, (m > s ? m : "") }' "$T/daily.$k" 2>/dev/null)
+	printf '{"sim":"%s","plan":"%s","allowance_gb":%s,"billing_day":%s,"period_start":"%s","period_end":"%s","down":%s,"up":%s%s}' "$k" "$p" "$a" "$b" "$ps" "$pe" "${1:-0}" "${2:-0}" "${3:+,\"since\":\"$3\"}"
 }
 
 plans() {

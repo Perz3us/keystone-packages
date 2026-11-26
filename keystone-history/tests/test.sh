@@ -68,6 +68,11 @@ echo "curl $*" >> "$FAKE_LOG"
 [ -n "$FAKE_CURL" ] && { printf "%s" "$FAKE_CURL"; exit ${FAKE_CURL_RC:-0}; }
 exit 1
 X
+cat > "$W/bin/vnstat" <<'X'
+#!/bin/sh
+[ -n "$FAKE_VNSTAT" ] && echo "$FAKE_VNSTAT" && exit 0
+exit 1
+X
 chmod +x "$W/bin/"*
 
 cat > "$W/cell.json" <<'X'
@@ -144,7 +149,8 @@ export FAKE_LOG="$W/log" FAKE_CELL="$W/cell.json" FAKE_BAND="$W/band.json" FAKE_
 	export FAKE_NOW=1000000 FAKE_QMODEM=1 FAKE_UCIDB="$W/ucidb" KS_SIM_CACHE="$W/sim" KS_SIM_CHECKED="$W/sim.checked" KS_COMMON="$HERE/../common/files/common.sh"
 	: > "$W/ucidb"; unset FAKE_DAY
 	unset FAKE_MM FAKE_PING_FAIL FAKE_TARGET FAKE_CURL FAKE_TCP FAKE_CURL_RC
-	export KS_VERSION_FILE="$W/version" KS_MIN_TIME=0
+	export KS_VERSION_FILE="$W/version" KS_MIN_TIME=0 KS_FW_STATS="$W/fw" VNSTAT="$W/bin/vnstat"
+	rm -rf "$W/fw"; unset FAKE_VNSTAT
 	echo 0.1.0 > "$W/version"
 }
 
@@ -519,7 +525,7 @@ OUT=$(rpc call info)
 case $OUT in *'"plans":[{"sim":"main","plan":"capped","allowance_gb":50,"billing_day":15,"period_start":"2026-11-15","period_end":"2026-12-14","down":30,"up":3}]}') ok "plan period sum" ;; *) bad "plan period sum ($OUT)" ;; esac
 OUT=$(echo '{"sim":"main","plan":"none"}' | rpc call set_plan)
 OUT=$(rpc call info)
-case $OUT in *'"plans":[{"sim":"main","plan":"","allowance_gb":0,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":130,"up":4}]}') ok "plan none uses calendar month" ;; *) bad "plan none uses calendar month ($OUT)" ;; esac
+case $OUT in *'"plans":[{"sim":"main","plan":"","allowance_gb":0,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":130,"up":4,"since":"2026-11-14"}]}') ok "plan none uses calendar month, and says counting began on the 14th" ;; *) bad "plan none uses calendar month ($OUT)" ;; esac
 
 setup
 OUT=$(echo '{"sim":"main","plan":"unlimited","billing_day":32}' | rpc call set_plan)
@@ -545,6 +551,36 @@ setup
 collect
 eq "fresh install seeds nothing" "$(grep -c 2026-11-01 "$W/tmp/daily.main")" 0
 
+monthsum() { awk -v m="${2:-2026-11}" 'substr($1, 1, 7) == m { d += $2; u += $3 } END { printf "%.0f %.0f\n", d, u }' "$1"; }
+setup; mkdir -p "$W/fw"
+echo "57000000000 9500000000" > "$W/fw/traffic.sim-main.2026-11"
+collect
+eq "installed mid-month, the month matches the firmware" "$(monthsum "$W/tmp/daily.main")" "57000000000 9500000000"
+eq "the gap is spread over the days never seen" "$(grep -c '^2026-11-' "$W/tmp/daily.main")" 20
+eq "evenly" "$(grep '^2026-11-05 ' "$W/tmp/daily.main")" "2026-11-05 3000000000 500000000"
+case $(rpc call info) in *'"since"'*) bad "a filled month needs no since" ;; *) ok "a filled month needs no since" ;; esac
+echo 2000 > "$W/sys/wwan0_1/statistics/rx_bytes"
+FAKE_NOW=1000120 collect
+eq "then only new traffic is added" "$(monthsum "$W/tmp/daily.main")" "57000001000 9500000000"
+eq "the monthly total follows" "$(cat "$W/tmp/traffic.2026-11")" "57000001000 9500000000"
+echo "keystone-history.sim_main.billing_day=15" > "$W/ucidb"
+case $(rpc call info) in *'"period_start":"2026-11-15","period_end":"2026-12-14","down":15000001000,"up":2500000000'*) ok "a billing period gets its share" ;; *) bad "a billing period gets its share ($(rpc call info))" ;; esac
+setup; mkdir -p "$W/fw"
+printf '2026-11-01 80000000000 9499999999\n' > "$W/tmp/daily.main"
+echo "57000000000 9500000000" > "$W/fw/traffic.sim-main.2026-11"
+collect
+eq "a firmware count lower than ours changes nothing" "$(monthsum "$W/tmp/daily.main")" "80000000000 9499999999"
+setup; mkdir -p "$W/fw"
+echo "1000 1000" > "$W/fw/traffic.sim-main.2026-11"
+collect
+eq "a gap under a megabyte is left alone" "$(grep -c '^2026-11-' "$W/tmp/daily.main")" 1
+setup; export FAKE_VNSTAT="2;wwan0_1;2026-11-20;10;5;15;1 bit/s;2026-11;38000000000;1900000000;39900000000;1 bit/s;9;9;18"; collect
+eq "vnstat's month is used when the firmware has none" "$(monthsum "$W/tmp/daily.main")" "38000000000 1900000000"
+setup; printf '2026-11-20 0 0\n' > "$W/tmp/daily.other"
+export FAKE_VNSTAT="2;wwan0_1;2026-11-20;10;5;15;1 bit/s;2026-11;38000000000;1900000000;39900000000;1 bit/s;9;9;18"; collect
+eq "but not with two SIMs, it counts the interface" "$(monthsum "$W/tmp/daily.main")" "0 0"
+unset FAKE_VNSTAT
+
 setup
 printf 'keystone-history.main=main
 keystone-history.main.keep_days=14
@@ -554,7 +590,6 @@ echo '{"sim":"main","plan":"none"}' | rpc call set_plan > /dev/null
 eq "a plan for the SIM called main leaves the settings alone" "$(sed -n 's/^keystone-history.main=//p' "$W/ucidb")" main
 eq "keep_days survives removing that plan" "$(sed -n 's/^keystone-history.main.keep_days=//p' "$W/ucidb")" 14
 
-# Bands in use, primary first (column 8)
 setup; FAKE_QMODEM=
 printf '%s\n' '{"rsrp":"-93","sinr":"15","pci":"151","earfcn":"1725","pband":"B3 (1800 MHz) @20 MHz","s1band":"B1 (2100 MHz) @15 MHz","s2band":"B1 (2100 MHz) @10 MHz","s3band":"-","s4band":"-"}' > "$W/g5/metrics_m.json"
 collect

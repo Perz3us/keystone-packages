@@ -93,7 +93,6 @@ setup() {
 
 lib() { KS_ALERTS_LIB=1; . "$HERE/files/keystone-alerts"; unset KS_ALERTS_LIB; }
 rpc() { sh "$HERE/files/keystone-alerts.rpcd" "$@"; }
-# bulk <n> <detail>: write n events straight into the store
 bulk() { awk -v n="$1" -v d="$2" 'BEGIN { for (i = 1; i <= n; i++) printf "%d\tdevice\t1800000000\t-\t1\tboot-a\t500\t%s\n", i, d }' > "$W/tmp/events"; echo $(($1 + 1)) > "$W/tmp/next_id"; }
 ids() { cut -f1 "$W/tmp/events" | tr '\n' ' ' | sed 's/ $//'; }
 
@@ -170,16 +169,12 @@ SZ=$(wc -c < "$W/etc/events" | tr -d ' ')
 [ "$SZ" -le 100000 ] && [ "$SZ" -gt 90000 ] && ok "flush size ($SZ)" || bad "flush size ($SZ)"
 eq "flush keeps next_id" "$(cat "$W/etc/next_id")" 1201
 
-# at <seconds>: move wall clock and uptime together, then tick
 at() { echo "$((1000 + $1)).00 1.00" > "$W/proc/uptime"; FAKE_NOW=$((1800000000 + $1)); sh "$HERE/files/keystone-alerts" tick; }
-# clock <uptime> <wall clock>: move them apart, then tick
 clock() { echo "$1.00 1.00" > "$W/proc/uptime"; FAKE_NOW=$2; sh "$HERE/files/keystone-alerts" tick; }
 ev() { awk -F '\t' -v t="$1" -v f="$2" '$2 == t { print $f }' "$W/tmp/events" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
 opt() { echo "keystone-alerts.$1=$2" >> "$W/ucidb"; }
-# powercut: RAM state is gone, flash stays
 powercut() { mv "$W/tmp" "$W/lost.$PASS.$FAIL"; mkdir "$W/tmp"; echo boot-b > "$W/proc/boot_id"; }
 
-# internet
 setup; at 0
 export FAKE_DOWN=1
 at 30; at 60
@@ -224,7 +219,6 @@ eq "an outage reaches flash at once" "$(cut -f2 "$W/etc/events" 2>/dev/null)" in
 unset FAKE_DOWN; at 120; at 150
 eq "and so does its end" "$(cut -f4 "$W/etc/events")" 1800000120
 
-# signal
 sig() { echo "$((1800000000 + $1)) $2 10 20 1 1 B3" >> "$W/kh/points"; at "$1"; }
 setup; sig 0 -111; sig 240 -111
 eq "low for 4 min is nothing" "$(ev signal 1)" ""
@@ -243,7 +237,6 @@ eq "no reading" "$(ev signal 1)" ""
 setup; sig 0 -111; at 400; at 800
 eq "stale reading ignored" "$(ev signal 1)" ""
 
-# devices
 setup
 printf '1 AA:bb:cc:00:00:01 192.168.1.2 tv *\n' > "$W/leases"
 printf '192.168.1.3 dev br-lan lladdr aa:bb:cc:00:00:02 REACHABLE\n10.0.0.1 dev wwan0_1 lladdr aa:bb:cc:00:00:99 REACHABLE\n' > "$W/neigh"
@@ -266,8 +259,7 @@ eq "the rest are remembered quietly" "$(wc -l < "$W/tmp/known_macs" | tr -d ' ')
 setup; opt device.mode off; : > "$W/leases"; at 0; printf '1 aa:bb:cc:00:00:03 192.168.1.4 x *\n' > "$W/leases"; at 30
 eq "device off still learns" "$(ev device 1)-$(cat "$W/tmp/known_macs")" "-aa:bb:cc:00:00:03"
 
-# data
-hist() { printf '{"version":"1","active_sim":"main","plans":[{"sim":"old","plan":"capped","allowance_gb":1,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":9000000000,"up":0},{"sim":"main","plan":"%s","allowance_gb":%s,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":%s,"up":0}]}\n' "$1" "$2" "$3" > "$W/hist.json"; }
+hist() { printf '{"version":"1","active_sim":"main","plans":[{"sim":"old","plan":"capped","allowance_gb":1,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":9000000000,"up":0},{"sim":"main","plan":"%s","allowance_gb":%s,"billing_day":1,"period_start":"2026-11-01","period_end":"2026-11-30","down":%s,"up":0%s}]}\n' "$1" "$2" "$3" "${4:+,\"since\":\"$4\"}" > "$W/hist.json"; }
 setup; export FAKE_DAY=2026-11-29; hist capped 10 8100000000; at 0; at 400; at 800
 eq "warn once" "$(ev data 8)" '{"sim":"main","level":"warn","pct":81,"runs_out":""}'
 hist capped 10 10100000000; at 1200; at 1600
@@ -289,6 +281,10 @@ setup; export FAKE_DAY=2026-11-02; hist capped 10 2000000000; at 0
 eq "pace waits for day 3" "$(ev data 1)" ""
 setup; export FAKE_DAY=2026-11-15; hist capped 10 4000000000; at 0
 eq "on pace" "$(ev data 1)" ""
+setup; export FAKE_DAY=2026-11-15; hist capped 10 4000000000 2026-11-11; at 0
+eq "pace counts from the day counting began" "$(ev data 8)" '{"sim":"main","level":"pace","pct":40,"runs_out":"2026-11-23"}'
+setup; export FAKE_DAY=2026-11-15; hist capped 10 4000000000 2026-11-14; at 0
+eq "and waits three counted days" "$(ev data 1)" ""
 setup; export FAKE_DAY=2026-11-29; hist capped 10 8100000000; awk '{ gsub(/,/, ",\n"); gsub(/":/, "\": "); print }' "$W/hist.json" > "$W/h2"; mv "$W/h2" "$W/hist.json"; at 0
 eq "pretty-printed reply" "$(ev data 1)" 1
 setup; opt data.warn_pct abc; export FAKE_DAY=2026-11-29; hist capped 10 8100000000; at 0
@@ -299,7 +295,6 @@ eq "data waits for the clock" "$(ev data 1)" ""
 setup; at 0
 eq "no keystone-history reply" "$(ev data 1)" ""
 
-# restarts
 setup; at 0
 eq "first run is not a restart" "$(ev restart 1)" ""
 echo boot-b > "$W/proc/boot_id"; at 30; at 60
@@ -309,7 +304,6 @@ eq "modem restart" "$(ev restart 8)" '{"what":"modem"}'
 setup; at 0; echo 9 > "$W/sys/wwan0/ifindex"; powercut; at 30
 eq "router restart is not also a modem restart" "$(ev restart 8)" '{"what":"router"}'
 
-# clock
 setup; : > "$W/leases"; export FAKE_DOWN=1; clock 500 1790000000
 printf '1 aa:bb:cc:00:00:03 192.168.1.4 x *\n' > "$W/leases"; clock 530 1790000030
 eq "offline since boot: time is approximate" "$(ev device 3)-$(ev device 5)" "1790000030-0"
@@ -321,7 +315,6 @@ setup; at 0; export FAKE_DOWN=1; at 30; at 60; at 90; unset FAKE_DOWN; at 120; a
 clock 1180 1800005180
 eq "jump moves start and end" "$(ev internet 3) $(ev internet 4)" "1800005030 1800005120"
 
-# power loss
 setup; at 0; export FAKE_DOWN=1; at 30; at 60; at 90; sh "$HERE/files/keystone-alerts" flush
 powercut
 sh "$HERE/files/keystone-alerts" restore
@@ -332,12 +325,9 @@ sh "$HERE/files/keystone-alerts" restore
 eq "restore does nothing while running" "$(cat "$W/tmp/next_id")" 1003
 eq "run state never reaches flash" "$(ls "$W/etc" | grep -c run)" 0
 
-# key and feed
 sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 N=00112233445566778899aabbccddeeff
-# feed <since> <key> [nonce]: ask the way the app does
 feed() { echo "{\"since\":$1,\"nonce\":\"${3:-$N}\",\"proof\":\"$(sha "$2:q:${3:-$N}:$1:$2")\"}" | rpc call feed; }
-# body <reply>: the signed part, unescaped
 body() { printf '%s' "$1" | sed 's/^{"body":"//; s/","sig":"[0-9a-f]*"}$//; s/\\"/"/g; s/\\\\/\\/g'; }
 setup; at 0
 eq "no key yet: feed says nothing" "$(feed 0 "")" "{}"
