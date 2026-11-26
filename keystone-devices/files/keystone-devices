@@ -132,9 +132,10 @@ sample() {
 	# address is never counted twice: only what each address added since last time is
 	# credited, to whichever device holds it now. A counter that went down was reset or
 	# expired and is new traffic. The first look at counters that were already running
-	# (daemon restart) only takes a baseline; nlbwmon instead brings its month so far.
+	# (daemon restart) only takes a baseline; nlbwmon instead brings its month so far,
+	# but only into a period that has nothing yet, or a restart would add it again.
 	first=0
-	[ -e "$R/raw" ] || { [ "$b" = nlbwmon ] || first=1; : > "$R/raw"; }
+	[ -e "$R/raw" ] || { [ "$b" = nlbwmon ] && [ ! -s "$f" ] || first=1; : > "$R/raw"; }
 	awk -v first=$first 'FILENAME == ARGV[1] { ld[$1] = $2; lu[$1] = $3; next }
 		{
 			had = $1 in ld

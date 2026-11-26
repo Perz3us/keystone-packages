@@ -178,6 +178,14 @@ eq "backend nlbwmon" "$(cat "$W/tmp/backend")" nlbwmon
 eq "nlbwmon counts" "$(period 2026-11-01)" "aa:bb:cc:00:00:01 500 40
 aa:bb:cc:00:00:02 0 7"
 case $(cat "$W/log") in *"nft -f"*|*iptables*) bad "no rules with nlbwmon" ;; *) ok "no rules with nlbwmon" ;; esac
+rm -f "$W/tmp/run/raw"; sample
+eq "a restart does not add the month again" "$(period 2026-11-01 | head -n 1)" "aa:bb:cc:00:00:01 500 40"
+cp "$W/tmp/period.2026-11-01" "$W/etc/"; rm -rf "$W/tmp"; mkdir -p "$W/tmp"
+cp "$W/etc/period.2026-11-01" "$W/tmp/"; sample
+eq "nor does a reboot" "$(period 2026-11-01 | head -n 1)" "aa:bb:cc:00:00:01 500 40"
+printf '{"columns":["mac","ip","conns","rx_bytes","rx_pkts","tx_bytes","tx_pkts"],"data":[["AA:BB:CC:00:00:01","192.168.1.2",3,600,5,40,4]]}' > "$W/nlbw.json"
+sample
+eq "then counts what is new" "$(period 2026-11-01 | head -n 1)" "aa:bb:cc:00:00:01 600 40"
 
 setup; export FAKE_NLBW_RUNNING=1
 printf '{"columns":["mac","ip","conns","rx_bytes","rx_pkts","tx_bytes","tx_pkts"],"data":[["00:00:00:00:00:00","0.0.0.0",3,900,5,90,4],["aa:bb:cc:00:00:01","192.168.1.2",1,10,0,7,1]]}' > "$W/nlbw.json"
